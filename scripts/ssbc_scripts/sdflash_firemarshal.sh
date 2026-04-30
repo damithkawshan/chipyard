@@ -2,6 +2,15 @@
 # sdboot_linux.sh – Write a FireMarshal Linux image to SD card for
 #                    booting on VCU118 RocketChip.
 #
+# Features:
+#   - Verifies the FireMarshal Linux binary exists before writing
+#   - Automatically unmounts any mounted SD card partitions
+#   - Writes the Linux image to SD card at sector 34
+#   - Optionally partitions the SD card if --format-data is given and partitions are missing
+#   - Optionally formats the second partition for persistent data (ext4 or hfs)
+#   - Powers off the SD card reader after writing (if supported)
+#   - Provides verification by dumping the first sector of the written image
+#
 # Boot flow:
 #   1. VCU118 bootrom (sdboot) initialises UART & SD, prints INIT/CMD*/LOADING…
 #   2. sdboot reads raw binary from SD sector 34 into DRAM at 0x80000000
@@ -10,10 +19,10 @@
 #
 # Prerequisites:
 #   - FireMarshal br-base-bin-nodisk-flat already built
-#   - SD card plugged in and partitioned (partition 1 starts at sector 34)
+#   - SD card plugged in (partitioning/formatting optional)
 #   - UART connected at 115200 8N1 to see output
 #
-# Usage:  bash sdboot_linux.sh [/dev/sdX]
+# Usage:  bash sdboot_linux.sh [/dev/sdX] [--format-data [ext4|hfs]]
 
 set -e
 
@@ -68,6 +77,40 @@ sync
 echo ""
 echo "── Verification (first 512 bytes at sector ${SECTOR}) ──"
 sudo dd if="$SDDEV" bs=512 skip=${SECTOR} count=1 status=none | hexdump -C | head -20
+
+# ── 6. Optionally partition the SD card if --format-data is given and partitions are missing ──
+if [[ "$2" == "--format-data" ]]; then
+    if ! lsblk -ln "$SDDEV" 2>/dev/null | grep -q "^$(basename $SDDEV)2"; then
+        echo ""
+        echo "── Creating partitions on $SDDEV ──"
+        sudo parted -s "$SDDEV" mklabel gpt
+        # Partition 1: starts at sector 34, size 512MiB
+        sudo parted -s "$SDDEV" unit s mkpart primary 34 1048613
+        # Partition 2: rest of the card
+        sudo parted -s "$SDDEV" unit s mkpart primary 1048614 100%
+        sudo partprobe "$SDDEV"
+        sleep 1
+        echo "Partitions created:"
+        lsblk "$SDDEV"
+    fi
+fi
+
+# ── 7. Optionally format the second partition for persistent data ──
+if [[ "$2" == "--format-data" ]]; then
+    FSTYPE="${3:-ext4}"
+    DATAPART="${SDDEV}2"
+    echo ""
+    echo "── Formatting $DATAPART as $FSTYPE ──"
+    if [ "$FSTYPE" = "ext4" ]; then
+        sudo mkfs.ext4 -L "PrototypeData" "$DATAPART"
+    elif [ "$FSTYPE" = "hfs" ]; then
+        sudo mkfs.hfs -v "PrototypeData" "$DATAPART"
+    else
+        echo "ERROR: Unknown filesystem type: $FSTYPE"
+        exit 1
+    fi
+    echo "Done formatting $DATAPART."
+fi
 
 # safely power off the SD reader if possible
 if command -v udisksctl >/dev/null 2>&1; then
