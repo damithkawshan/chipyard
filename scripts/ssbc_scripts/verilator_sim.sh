@@ -6,7 +6,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)" # chipyard root
 # Test application (override with: ./ssbc_testapp.sh nettle_aes)
 APP_NAME="${1:-matmult_float}"
 
-TEST_APP_LOC="${TEST_APP_LOC:-$REPO_ROOT/generators/rocket-chip-inclusive-cache/sw/verilator_sim/${APP_NAME}.riscv}"
+TEST_APP_LOC=$1
+
+# TEST_APP_LOC="${TEST_APP_LOC:-$REPO_ROOT/generators/rocket-chip-inclusive-cache/sw/verilator_sim/${APP_NAME}.riscv}"
 # TEST_APP_LOC="${TEST_APP_LOC:-$REPO_ROOT/tests/ssbc_tests/build/${APP_NAME}.riscv}"
 RESULTS_DIR="${RESULTS_DIR:-$REPO_ROOT/generators/rocket-chip-inclusive-cache/results/${APP_NAME}_$(date +%d%b%Y_%H-%M-%S)}"
 MAKE_JOBS="${MAKE_JOBS:-20}"
@@ -165,7 +167,7 @@ run_config() {
     BINARY="$TEST_APP_LOC" \
     CONFIG="$config" \
     VERILATOR_THREADS="$VERILATOR_THREADS" \
-    # SIM_FLAGS=+max-cycles=500000000 \
+    SIM_FLAGS=+max-cycles=500000000 \
     > "$run_log" 2>&1
   popd >/dev/null
 }

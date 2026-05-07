@@ -5,7 +5,7 @@ REPO_DIR=/home/damith/Research/repos/chipyard_performance_eval/chipyard
 source "$REPO_DIR/env.sh"
 
 
-VCU118CONFIG=QuadRocketVCU118Config
+VCU118CONFIG=SingleRocketVCU118L18K64K8WL2Config
 
 FPGA_BUILD_DIR="$REPO_DIR/fpga/"
 

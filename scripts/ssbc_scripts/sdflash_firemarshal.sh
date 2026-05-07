@@ -19,6 +19,10 @@
 #
 # Prerequisites:
 #   - FireMarshal br-base-bin-nodisk-flat already built
+#   - Build commands:
+#       cd $CHIPYARD_DIR/software/firemarshal
+#       ./marshal -v -d build br-base.json
+#       ./marshal -v -d install -t prototype br-base.json
 #   - SD card plugged in (partitioning/formatting optional)
 #   - UART connected at 115200 8N1 to see output
 #
