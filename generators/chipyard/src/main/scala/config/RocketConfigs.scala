@@ -115,3 +115,121 @@ class SV48RocketConfig extends Config(
   new freechips.rocketchip.rocket.WithSV48 ++
   new freechips.rocketchip.rocket.WithNHugeCores(1) ++
   new chipyard.config.AbstractConfig)
+
+class QuadBigRocket8KL1_128KL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 128) ++ // 128KB 16-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(4) ++                                    // 4 Big Rocket cores
+  new chipyard.config.AbstractConfig)
+
+class QuadBigRocket8KL1_64K8WL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 64) ++ // 64KB 8-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(4) ++                                    // 4 Big Rocket cores
+  new chipyard.config.AbstractConfig)
+
+class QuadBigRocket8KL1_256K16WL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256) ++ // 256KB 16-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(4) ++                                    // 4 Big Rocket cores
+  new chipyard.config.AbstractConfig)
+
+class SingleRocket8KL1_256KL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 128) ++ // 128KB 8-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++                                    // 1 Big Rocket core
+  new chipyard.config.AbstractConfig)
+
+class SingleRocket8KL1_64K8WL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 64) ++ // 64KB 8-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++                                    // 1 Big Rocket core
+  new chipyard.config.AbstractConfig)
+
+class SingleRocket8KL1_256K16WL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256) ++ // 256KB 16-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++                                    // 1 Big Rocket core
+  new chipyard.config.AbstractConfig)
+
+class QuadBigRocket8KL1_256KL2Config extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256) ++ // 256KB 16-way L2
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(4) ++                                    // 4 Big Rocket cores
+  new chipyard.config.AbstractConfig)
+
+class SingleRocketVCU118L18K256K16WL2ConfigSBCPhase2 extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256, sbcAutoMigrate = true) ++ // SBC auto-migration enabled, 256KB 16-way L2 ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 32 sets * 4 ways * 64B = 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++                                    // 1 Big Rocket core
+  new chipyard.config.AbstractConfig)
+
+class VerilatorRocket8KL116KL2Config extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++  // ICache with 2KB capacity (4 sets × 8 ways × 64B)
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++  // DCache with 2KB capacity (4 sets × 8 ways × 64B)
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true) ++ // 16KB 8-way L2                                 // 4 Big Rocket cores
+  new chipyard.config.AbstractConfig)
+
+// SBC OFF control: identical geometry to VerilatorRocket8KL116KL2Config but set-balancing disabled.
+// Used to prove whether a data-correctness failure is caused by migration at all.
+class VerilatorRocket8KL116KL2NoSbcConfig extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, enableSetBalancing = false) ++
+  new chipyard.config.AbstractConfig)
+
+// SBC shadow-hunt config (003 Amendment 11): the standard VerilatorRocket8KL116KL2Config plus the
+// sim-only shadow models (sbcShadow) and counter printfs (sbcDebug). NO sbcForceDstSet — migrations
+// land where a real workload sends them, the realistic case. sbcShadow/sbcDebug are sim-only.
+// Amendment 11 follow-up: the auto-derived threshold is T_hi=2*nWays-1=15
+// (=satMax), so a benign matmul almost never migrates; migrationThreshold=4/clear=2 makes a set migrate
+// after only a few net misses so a real self-checking workload actually exercises the serve-in-place
+// datapath while the BankedStore/homeShadow address models are armed. tmp.c is unchanged, so its
+// checksum oracle (vs NoSbcConfig) still validates the migrated data.
+class VerilatorRocket8KL116KL2SbcShadowConfig extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, migrationThreshold = 4, migrationClearThreshold = 2) ++
+  new chipyard.config.AbstractConfig)
+
+// SBC serve-in-place test config (003 §10.3): stock SBC geometry, pairing PINNED to 5<->6 via
+// sbcForceDstSet=6 so sw/serve_in_place_test.c can address the partner row directly. Partner 6 (not 7)
+// keeps HOT_SET 5 and PARTNER 6 in DIFFERENT L1 D$ sets (D$ set = L2 set & 1). sbcShadow on for the
+// BankedStore/homeShadow models. Under sbcForceDstSet, forcedLegal (SetBalanceUnit) keeps 1:1 pinning.
+class VerilatorRocket8KL116KL2SipTestConfig extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, sbcForceDstSet = 6) ++
+  new chipyard.config.AbstractConfig)
+
+// SBC serve-in-place DUAL-core test config (003 §10.6 S3/S4): two big cores so a SECOND probe-capable
+// client can hold a parked line while the first writes/reads it — the only way secProbe (the 9a
+// probe-back path) can fire. Same L2 geometry and 5<->6 pinning. Run serve_in_place_dual.riscv.
+class VerilatorRocket8KL116KL2SipTestDualConfig extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(2) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, sbcForceDstSet = 6) ++
+  new chipyard.config.AbstractConfig)
