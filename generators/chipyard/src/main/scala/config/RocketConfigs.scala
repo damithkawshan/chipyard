@@ -172,6 +172,32 @@ class SingleRocketVCU118L18K256K16WL2ConfigSBCPhase2 extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(1) ++                                    // 1 Big Rocket core
   new chipyard.config.AbstractConfig)
 
+// ---------------------------------------------------------------------------------------------
+// SBC on VCU118, synthesis-clean. Same geometry as ...SBCPhase2 above (256KB 16-way L2 = 256 sets,
+// 8KB L1s) but with the two simulation-only knobs OFF:
+//   sbcShadow=false - the shadow model allocates one register per (set,way). At 256x16 that is ~4096
+//                     entries, roughly 123k flip-flops, and its asserts do not synthesize. Pure cost.
+//   sbcDebug=false  - simulation printfs, meaningless in a bitstream.
+// Thresholds are left to auto-derive: for nWays=16 that is satCounterBits=5, T_hi=31, T_lo=16, which
+// is exactly the paper's rule (displace only at max saturation, destination below K).
+class SingleRocketVCU118L18K256K16WL2ConfigSBC extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++                                // 8KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++                                // 8KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+// The SBC-off twin. Identical in every other respect, so any difference measured between the two is
+// SBC's. Needed for a baseline: enableSetBalancing is compile-time, there is no runtime disable.
+class SingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256,
+    enableSetBalancing = false, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 class VerilatorRocket8KL116KL2Config extends Config(
   new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++  // ICache with 2KB capacity (4 sets × 8 ways × 64B)
   new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++

@@ -20,6 +20,10 @@ import testchipip.serdes.{SerialTLKey}
 import chipyard._
 import chipyard.harness._
 
+object VCU118ConfigConsts {
+  val sdboot_dir = "./fpga/src/main/resources/vcu118/sdboot_slow"
+}
+
 class WithDefaultPeripherals extends Config((site, here, up) => {
   case PeripheryUARTKey => List(UARTParams(address = BigInt(0x64000000L)))
   case PeripherySPIKey => List(SPIParams(rAddress = BigInt(0x64001000L)))
@@ -31,9 +35,9 @@ class WithSystemModifications extends Config((site, here, up) => {
   case BootROMLocated(x) => up(BootROMLocated(x), site).map { p =>
     // invoke makefile for sdboot
     val freqMHz = (site(SystemBusKey).dtsFrequency.get / (1000 * 1000)).toLong
-    val make = s"make -C fpga/src/main/resources/vcu118/sdboot PBUS_CLK=${freqMHz} bin"
+    val make = s"make -C ${VCU118ConfigConsts.sdboot_dir} PBUS_CLK=${freqMHz} bin"
     require (make.! == 0, "Failed to build bootrom")
-    p.copy(hang = 0x10000, contentFileName = s"./fpga/src/main/resources/vcu118/sdboot/build/sdboot.bin")
+    p.copy(hang = 0x10000, contentFileName = s"${VCU118ConfigConsts.sdboot_dir}/build/sdboot.bin")
   }
   case ExtMem => up(ExtMem, site).map(x => x.copy(master = x.master.copy(size = site(VCU118DDRSize)))) // set extmem to DDR size
   case SerialTLKey => Nil // remove serialized tl port
@@ -63,6 +67,70 @@ class RocketVCU118Config extends Config(
   new WithVCU118Tweaks ++
   new chipyard.RocketConfig
 )
+
+class QuadRocketVCU118ConfigSatCounter extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.QuadBigRocket8KL1_64K8WL2Config // 4-core Rocket with 8KB L1 and 64KB L2
+)
+
+class QuadRocketVCU118ConfigTLSignalBasedSatCounterMorrisCounterBugfixed extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.QuadBigRocket8KL1_64K8WL2Config // 4-core Rocket with 8KB L1 and 128KB L2
+)
+
+class QuadRocketVCU118ConfigTLSignalBasedSatCounterMorrisCounterBugfixedProbeIncludedCounter extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.QuadBigRocket8KL1_64K8WL2Config // 4-core Rocket with 8KB L1 and 128KB L2
+)
+
+class QuadRocketVCU118ConfigSatTLCounter256l16W extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.QuadBigRocket8KL1_256K16WL2Config // 4-core Rocket with 8KB L1 and 256KB L2
+)
+
+class SingleRocketVCU118L18K64K8WL2ConfigTLCounter extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocket8KL1_64K8WL2Config // 1-core Rocket with 8KB L1 and 64KB L2
+)
+
+
+class SingleRocketVCU118L18K256K16WL2ConfigTLCounter extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocket8KL1_256K16WL2Config // 1-core Rocket with 8KB L1 and 256KB L2
+)
+
+class FPGASingleRocketVCU118L18K256K16WL2ConfigSBCPhase2Finish extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K256K16WL2ConfigSBCPhase2 // 1-core Rocket with 8KB L1 and 256KB L2
+)
+
+// Synthesis-clean SBC pair for the FPGA measurement (shadow + debug off). Build both: the SBC-off
+// twin is the only way to say whether SBC helped, since enableSetBalancing is compile-time.
+class FPGASingleRocketVCU118L18K256K16WL2ConfigSBC extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K256K16WL2ConfigSBC
+)
+
+class FPGASingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K256K16WL2ConfigNoSbc
+)
+
+class QuadRocketVCU118ConfigSatTLCounter256KL2Config extends Config(
+  new WithFPGAFreq25MHz  ++
+  new WithVCU118Tweaks ++
+  new chipyard.QuadBigRocket8KL1_256KL2Config // 4-core Rocket with 8KB L1 and 256KB L2
+)
+
 // DOC include end: AbstractVCU118 and Rocket
 
 class BoomVCU118Config extends Config(
