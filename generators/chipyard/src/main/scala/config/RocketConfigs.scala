@@ -206,7 +206,7 @@ class VerilatorRocket8KL116KL2SbcShadowConfig extends Config(
   new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
   new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
-  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, migrationThreshold = 4, migrationClearThreshold = 2) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true) ++
   new chipyard.config.AbstractConfig)
 
 // SBC serve-in-place test config (003 §10.3): stock SBC geometry, pairing PINNED to 5<->6 via
