@@ -198,6 +198,32 @@ class SingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
   new chipyard.config.AbstractConfig)
 
+// ---------------------------------------------------------------------------------------------
+// Paper-geometry L1 pair (2026-09-12): tests whether our low measured miss rates (~4.5%) are an
+// L1/L2 sizing artifact rather than a counter bug. Rolan et al. use a 32kB/8-way L1 behind their
+// L2s (Table 1); ours had been 8kB/4-way. Default DCacheParams/ICacheParams are nSets=64/nWays=4
+// (16KB); overriding nWays=8 with nSets left at the 64 default gives 64*8*64B = 32KB/8-way exactly.
+// Same InclusiveCache geometry (256KB 16-way L2) as the 8KB-L1 pair above, so any change in
+// measured miss rate isolates to the L1, not the L2. Compare against SingleRocketVCU118L18K...
+// (8KB L1) — NOT against each other's SBC/NoSbc twin, which isolates SBC instead.
+class SingleRocketVCU118L132K256K16WL2ConfigSBC extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(8) ++                                 // 64*8*64B = 32KB L1D
+  new freechips.rocketchip.rocket.WithL1ICacheWays(8) ++                                 // 64*8*64B = 32KB L1I
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+// The SBC-off twin, identical L1/L2 geometry. enableSetBalancing is compile-time, so this is
+// required for any SBC-vs-baseline comparison, exactly as for the 8KB-L1 pair above.
+class SingleRocketVCU118L132K256K16WL2ConfigNoSbc extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 256,
+    enableSetBalancing = false, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(8) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(8) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 class VerilatorRocket8KL116KL2Config extends Config(
   new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++  // ICache with 2KB capacity (4 sets × 8 ways × 64B)
   new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++

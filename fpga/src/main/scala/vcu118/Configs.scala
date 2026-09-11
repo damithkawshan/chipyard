@@ -125,6 +125,28 @@ class FPGASingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
   new chipyard.SingleRocketVCU118L18K256K16WL2ConfigNoSbc
 )
 
+// Paper-geometry L1 pair (2026-09-12) — see RocketConfigs.scala for the rationale. 32KB/8-way L1s,
+// same 256KB/16-way L2 as the 8KB-L1 pair above.
+class FPGASingleRocketVCU118L132K256K16WL2ConfigSBC extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L132K256K16WL2ConfigSBC
+)
+
+class FPGASingleRocketVCU118L132K256K16WL2ConfigNoSbc extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L132K256K16WL2ConfigNoSbc
+)
+
+// Same geometry/params as ...ConfigSBC, built from the RTL that now carries the SBC_StatsReset MMIO
+// register (0x3B8, counter-only reset). Distinct name so its bitstream dir is clearly the one with it.
+class FPGASingleRocketVCU118L18K256K16WL2ConfigSBCResetEnabled extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K256K16WL2ConfigSBC
+)
+
 class QuadRocketVCU118ConfigSatTLCounter256KL2Config extends Config(
   new WithFPGAFreq25MHz  ++
   new WithVCU118Tweaks ++
