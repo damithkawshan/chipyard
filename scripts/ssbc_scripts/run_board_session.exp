@@ -1,0 +1,731 @@
+#!/usr/bin/expect --
+#
+# run_board_session.exp - program the VCU118, boot Linux, push sbc_read, run a measurement set.
+#
+# DEFAULT IS A ONE-BITSTREAM A/B (task 006). One SBC bitstream is programmed once, and the whole
+# WORKLOADS set is measured TWICE on it:
+#
+#   phase 1  migrate OFF  - SBC_MigrateEnable=0, so no migration ever starts. Plain-L2 half.
+#   phase 2  migrate ON   - SBC_MigrateEnable=1. SBC half.
+#
+# Both halves therefore share silicon, routing and clock, which removes build-to-build
+# place-and-route variation as a confound. The switch is driven by ./sbc_read --migrate=.
+#
+# THE ORDER IS NOT ARBITRARY. The OFF half parks nothing, and that is exactly what makes
+# `--reset-all` legal before the ON half (it wipes the AT, which is a parked line's only record of
+# where it belongs). Running ON first would leave lines parked that NOTHING in software can flush -
+# that needs a reboot. sbc_read refuses the reset rather than corrupting, so the mistake is caught.
+#
+# What this does NOT replace: the SBC hardware is physically present in both halves, so the area
+# and Fmax cost of SBC still needs a separate NoSbc SYNTHESIS. Keep -nosbc for that.
+# Caveat measured 2026-09-10 (coder task 006, gate G3): "switch off" does NOT reproduce a true
+# NoSbc build's counters - L2_Accesses ran 5.2% low and L2_Hits 7.4% low, though misses and outer
+# block-fetches were within ~1.5%. Quote that band; do not claim the halves are identical silicon
+# behaviour.
+#
+# Usage:
+#   ./run_board_session.exp                        # DEFAULT: one-bitstream A/B, OFF half then ON
+#   ./run_board_session.exp -ab                    # same thing, explicitly
+#   ./run_board_session.exp -sbc                   # SBC bitstream, ONE phase (switch left as found)
+#   ./run_board_session.exp -nosbc                 # NoSBC bitstream, one phase (the synthesis control)
+#   ./run_board_session.exp -bit /path/to/x.bit    # explicit bitstream
+#   ./run_board_session.exp -noprog                # board already programmed, skip Vivado
+#   ./run_board_session.exp -viascript             # go via connect_serial.sh (needs SUDO_PASS)
+#   ./run_board_session.exp -poll 60               # long run: sample counters every 60 s
+#   ./run_board_session.exp -tmo 14400             # allow 4 h per workload (default 7200)
+#   ./run_board_session.exp -boottmo 3600          # tolerate a very slow boot (default 1800)
+#   ./run_board_session.exp -policy plru           # 008: victim policy (L2_Replacement) random|plru,
+#                                                  #      set after boot and confirmed by read-back.
+#                                                  #      Without it the policy is left as found
+#
+# In A/B mode -tmo covers ONE phase, so a full session needs roughly twice that plus boot.
+#
+# No sudo needed by default: you are in the `dialout` group, so picocom opens the tty directly.
+# (-viascript uses connect_serial.sh, which calls `sudo fuser -k`. sudo timestamps are per-tty,
+#  so `sudo -v` in your shell does NOT carry into expect's pty - hence SUDO_PASS for that mode.)
+
+# ----------------------------------------------------------------------------- config
+set CY        "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
+set SCRIPTS   "$CY/scripts/ssbc_scripts"
+set GENSRC    "$CY/fpga/generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness"
+set NOSBC_BIT "$GENSRC.FPGASingleRocketVCU118L18K256K16WL2ConfigNoSbc/obj/VCU118FPGATestHarness.bit"
+set SBC_BIT   "$GENSRC.FPGASingleRocketVCU118L18K256K16WL2ConfigSBCResetEnabled/obj/VCU118FPGATestHarness.bit"
+
+set SBC_READ  "$CY/generators/rocket-chip-inclusive-cache/sw/build/sbc_read"
+set SW_DIR    "$CY/generators/rocket-chip-inclusive-cache/sw"
+# Everything pushed to the board. sbc_read must stay first - the identity check runs it.
+set PUSH_FILES [list $SBC_READ "$SW_DIR/run_sbc_window.sh"]
+set LOGIN     "root"
+set PASSWORD  "fpga"
+set PROMPT    "# "
+
+# Serial settings. MUST stay in step with connect_serial.sh - the zmodem window/packet sizes
+# are what keep transfers stable on this RTS/CTS-less UART.
+set DEVICE    "/dev/ttyUSB2"
+set BAUD      "115200"
+set SEND_CMD  "sz -vv -b -w 1024 -L 128"
+set RECV_CMD  "rz -vv -b -E"
+
+# This UART has no RTS/CTS. Typing at full speed drops characters (that is how "./sbc_read"
+# arrived at the board as "./sbc_red"). Pace every keystroke and verify the echo.
+set send_slow {1 .008}
+
+# Where the benchmarks live on the SD card, and which omnetpp input set to stage.
+# The measured run uses `ref` with an explicit --sim-time-limit, overriding its omnetpp.ini
+# (2.25s), and runs to COMPLETION - see the WORKLOADS block below.
+#
+# test / train / ref build the SAME NETWORK. Diffing the three omnetpp.ini files shows they
+# differ ONLY in `seed-set` and `sim-time-limit` (0.003s / 0.15s / 2.25s) - every largeNet.*
+# parameter is identical. So once we override --sim-time-limit the choice of set changes nothing
+# but the RNG seed: picking `test` does NOT make the run smaller or faster.
+#
+# The network is ~300 LANs x ~24 hosts, i.e. thousands of hosts and tens of thousands of modules.
+# BUILDING it is a large fixed cost that --sim-time-limit does not reduce at all, which is why
+# lowering the limit buys much less than you would expect.
+set SRC_DIR   "/mnt/damith_vcu118"
+set STAGE     "test_dir"
+set OMNET_SET "520.omnetpp_r_run_ref"
+set OMNET_BIN "omnetpp_r_base.riscv-64"
+set SETUP_TMO 3600
+# Seconds of SILENCE to tolerate while booting. This is not the total boot time: every line of
+# bootrom/kernel output below resets the clock, so a slow-but-progressing boot never trips it.
+set BOOT_TMO  1800
+
+# Setup. Idempotent and NOT measured - each line is guarded so a re-run is safe.
+# `grep /proc/mounts` rather than `mountpoint`, which busybox may not provide.
+# NB: [list ...], not braces - braces would stop $SRC_DIR/$OMNET_SET substituting.
+set SETUP [list \
+    "grep -q ' /mnt ' /proc/mounts || mount /dev/mmcblk0p2 /mnt" \
+    "mkdir -p $STAGE" \
+    "test -x $STAGE/memtest || cp -r $SRC_DIR/memtest $STAGE/" \
+    "test -x $STAGE/$OMNET_SET/$OMNET_BIN || cp -r $SRC_DIR/$OMNET_SET $STAGE/" \
+]
+
+# The measured set. Entries are run VERBATIM, so each line says how it is measured.
+# Keep IDENTICAL between the SBC and NoSBC runs.
+#
+# FIXED WORK, NOT FIXED TIME. The benchmark runs to completion under `sbc_read --zero -- <cmd>`:
+# zero the counters, run, read. --sim-time-limit=1s bounds the work (ref's own ini asks 2.25s),
+# so both bitstreams execute the identical program and the memory-traffic figures are comparable.
+# The old fixed-duration window is gone deliberately - it killed the workload on a timer, so the
+# two halves did DIFFERENT amounts of work (2026-09-11: 853 M L2 accesses migration-off vs 682 M
+# on, i.e. the SBC half got ~20% less of the program done). See CLAUDE.md, "same work".
+#
+# Run in a subshell: `cd` must not leak into the persistent serial shell.
+#
+# --cmdenv-status-frequency=0.0003s + --cmdenv-performance-display=true are PROGRESS, not workload.
+# Frequency is in SIMULATED TIME, not wall-clock: 0.0003s means print every 0.3 ms of omnetpp
+# simulation. SPEC ships cmdenv-status-frequency=5000000s (58 simulated days) - run is silent by
+# DESIGN and cannot be told from a hang. Status carries ev/sec, simsec/sec, and FES message counts.
+# Keep frequency IDENTICAL across both halves - they are cheap, but not free to compute.
+# stderr still goes to wl.err; stdout now reaches the console so the transcript records progress.
+#
+# `echo workload rc=$?` + `tail -3 wl.err` exist because sbc_read RETURNS the child's exit status
+# but never prints it (sbc_read.c: `return WIFEXITED(st) ? WEXITSTATUS(st) : 1`). Without this a
+# benchmark that dies on its first instruction still produces a normal-looking [SBC-WINDOW] dump
+# and the session reports success - a fast "clean" run that measured nothing. rc must be 0.
+set WORKLOADS [list \
+    "(cd $STAGE/$OMNET_SET && /root/sbc_read --zero -- sh -c './$OMNET_BIN -c General -r 0 --sim-time-limit=0.002s --cmdenv-status-frequency=0.001s --cmdenv-performance-display=true 2> wl.err' ; echo \"workload rc=\$?\" ; tail -3 wl.err)" \
+]
+# Alternatives:
+#   "./sbc_read --zero -- ./$STAGE/memtest"                        - short, runs to completion
+#   "WINDOW_SECS=600 DELAY_SECS=60 WL_BASE=$STAGE ./run_sbc_window.sh omnetpp"
+#                                                                  - OLD fixed-TIME window.
+#                                                                    Do not use for A/B: see above.
+
+# Seconds to allow ONE workload. -1 is Expect's "no timeout": wait as long as the benchmark
+# needs. That is the right default here because the workload now RUNS TO COMPLETION - a deadline
+# would abort a good run and leave you with no reading at all, and the wall-clock cost of 1
+# simulated second of omnetpp `ref` at 50 MHz is not yet measured.
+# Pass -tmo <secs> to re-impose a limit (e.g. for an unattended overnight batch).
+# NB: this bounds only the WAIT FOR RESULTS. The echo check inside board_cmd keeps its own short
+# timeout, so a character dropped on this RTS/CTS-less UART still fails fast instead of hanging.
+set WORK_TMO -1
+
+# Poll interval, seconds. 0 = single --zero window (one aggregate number).
+# >0 = zero once, start the workload in the background, then read the free-running counters
+# every N seconds. Gives a time series AND makes a 32-bit wrap visible (a counter going DOWN),
+# which a single aggregate reading cannot show.
+set POLL 0
+
+# ----------------------------------------------------------------------------- args
+# Default: ONE phase, SBC bitstream, migration ON. Boot -> copy -> reset counters -> migrate on
+# -> run. No migrate-OFF half: the off-side baseline is already recorded in
+# ai-documents/performance/fpga-ab-baseline-2026-09-11.md, and a second half doubles an already long session.
+# Pass -ab for the two-phase OFF-then-ON A/B when you want both halves in one boot.
+set AB_MODE    0
+set BIT        $SBC_BIT
+set DO_PROG    1
+set VIA_SCRIPT 0
+set WANT_SBC   1
+# 008: "" = leave L2_Replacement as found (a fresh boot is random); else random|plru.
+set POLICY     ""
+# -ab must not touch BIT: `-bit X -ab` used to program the default SBC bitstream instead of X
+# (2026-09-15: a "64K" A/B ran on the 256K image). BIT already defaults to $SBC_BIT, and A/B mode
+# checks after boot that the loaded image is an SBC build.
+for {set i 0} {$i < $argc} {incr i} {
+    set a [lindex $argv $i]
+    switch -- $a {
+        "-ab"        { set AB_MODE 1 }
+        "-bit"       { incr i; set BIT [lindex $argv $i]; set WANT_SBC -1 }
+        "-sbc"       { set BIT $SBC_BIT;   set WANT_SBC 1; set AB_MODE 0 }
+        "-nosbc"     { set BIT $NOSBC_BIT; set WANT_SBC 0; set AB_MODE 0 }
+        "-noprog"    { set DO_PROG 0 }
+        "-viascript" { set VIA_SCRIPT 1 }
+        "-poll"      { incr i; set POLL [lindex $argv $i] }
+        "-tmo"       { incr i; set WORK_TMO [lindex $argv $i] }
+        "-boottmo"   { incr i; set BOOT_TMO [lindex $argv $i] }
+        "-policy"    { incr i; set POLICY [lindex $argv $i]
+                       if {$POLICY ne "random" && $POLICY ne "plru"} { puts "-policy must be random or plru"; exit 2 } }
+        default      { puts "unknown arg: $a"; exit 2 }
+    }
+}
+
+if {![file exists $SBC_READ]} { puts "MISSING: $SBC_READ"; exit 1 }
+if {$DO_PROG && ![file exists $BIT]} { puts "MISSING bitstream: $BIT"; exit 1 }
+
+set stamp [clock format [clock seconds] -format "%Y%m%d-%H%M%S"]
+
+# Log dir; fall back if scripts/logs is not writable (it has been root-owned before).
+set LOGDIR "$SCRIPTS/../logs"
+catch { file mkdir $LOGDIR }
+if {![file isdirectory $LOGDIR] || ![file writable $LOGDIR]} {
+    set LOGDIR "$env(HOME)/sbc-logs"
+    catch { file mkdir $LOGDIR }
+    puts "note: $SCRIPTS/../logs is not writable - logging to $LOGDIR instead"
+}
+set LOGPATH "$LOGDIR/board_session_$stamp.log"
+log_file -a $LOGPATH
+
+puts "\n=================================================================="
+puts "===== TEST CONFIGURATION"
+puts "=================================================================="
+puts "===== bitstream     : $BIT"
+if {$WANT_SBC == 1} {
+    puts "=====   (expected)  : SBC"
+} elseif {$WANT_SBC == 0} {
+    puts "=====   (expected)  : NoSBC"
+} else {
+    puts "=====   (expected)  : unchecked (-bit)"
+}
+if {$AB_MODE} {
+    puts "===== mode          : one-bitstream A/B - phase 1 migrate OFF, then phase 2 migrate ON"
+} else {
+    puts "===== mode          : single phase (migrate switch left exactly as found)"
+}
+puts "===== policy        : [expr {$POLICY eq {} ? {as found (reported after boot)} : $POLICY}]"
+puts "===== program FPGA  : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog, using whatever is loaded)}}]"
+puts "===== serial path   : [expr {$VIA_SCRIPT ? {connect_serial.sh (needs SUDO_PASS)} : {direct picocom}}]"
+puts "===== device / baud : $DEVICE @ $BAUD"
+puts "===== sbc_read      : $SBC_READ"
+puts "===== push files    : [join $PUSH_FILES {, }]"
+puts "===== workload set  : $OMNET_SET  (bin: $OMNET_BIN)"
+puts "===== workload(s)   :"
+foreach w $WORKLOADS { puts "=====   $w" }
+puts "===== setup cmds    :"
+foreach c $SETUP { puts "=====   $c" }
+puts "===== boot timeout  : ${BOOT_TMO}s (silence tolerance, not total boot time)"
+puts "===== setup timeout : ${SETUP_TMO}s"
+if {$WORK_TMO == -1} {
+    puts "===== work timeout  : none (runs to completion)"
+} else {
+    puts "===== work timeout  : ${WORK_TMO}s per workload"
+}
+if {$POLL > 0} {
+    puts "===== poll interval : every ${POLL}s (time series)"
+} else {
+    puts "===== poll interval : 0 (single zero/run/read window)"
+}
+puts "===== login         : $LOGIN / $PASSWORD"
+puts "===== log           : $LOGPATH"
+if {!$DO_PROG} {
+    puts "===== NOTE: -noprog. Whatever bitstream is already on the board is what you measure."
+}
+puts "=================================================================="
+puts ""
+
+# ----------------------------------------------------------------------------- helpers
+# Send a command and confirm the board echoed it back intact. On a UART with no flow control
+# a dropped character silently turns into a different command, so verify rather than hope.
+proc board_cmd {cmd {tmo 60}} {
+    global PROMPT
+    set timeout $tmo
+    send -s "$cmd\r"
+    # Verify the board echoed what we sent. Only the first 60 chars: past the terminal width the
+    # shell's line editor redraws the line, so an exact match on a long command false-fails.
+    set probe [string range $cmd 0 59]
+    expect {
+        -ex $probe { return 1 }
+        timeout {
+            puts "\n!!! echo mismatch - a character was dropped sending: $cmd"
+            return 0
+        }
+    }
+}
+
+# Put the migrate switch in a named position and CONFIRM it, reading sbc_read's own read-back rather
+# than trusting the write. `migflag` is the only difference between the two halves of the A/B.
+# Returns 1 on success, 0 if the phase must not proceed.
+proc set_switch {migflag} {
+    global PROMPT
+    # What we ASKED for. The read-back must agree: without this the ON and OFF arms below both
+    # counted as success whatever the board reported, so a phase-2 that came back OFF would have
+    # been announced as "confirmed" and measured as the SBC half with migration never enabled -
+    # two identical halves and an empty A/B.
+    if {[string match "*--migrate=on*" $migflag]} {
+        set want "ON"
+    } elseif {[string match "*--migrate=off*" $migflag]} {
+        set want "OFF"
+    } else {
+        set want ""
+    }
+    if {![board_cmd "./sbc_read $migflag"]} { return 0 }
+    set timeout 180
+    set ok 0
+    set got ""
+    expect {
+        -re {refusing --reset-all: ([0-9]+) line} {
+            puts "\n!!! sbc_read refused the reset: $expect_out(1,string) line(s) still parked."
+            puts "!!! Nothing in software can un-park a line, so this session cannot give a clean"
+            puts "!!! ON half. Reboot the board and run the OFF half first."
+            return 0
+        }
+        -re {read back .* after writing} {
+            puts "\n!!! SBC_MigrateEnable did not take. Is this bitstream older than task 006?"
+            return 0
+        }
+        -re {migrate *: *n/a} {
+            puts "\n!!! SBC is not built into this bitstream - the switch controls nothing here."
+            return 0
+        }
+        -re {migrate *: *ON}  { set got "ON";  set ok 1 }
+        -re {migrate *: *OFF} { set got "OFF"; set ok 1 }
+        timeout {
+            puts "\n!!! sbc_read never reported a switch state"
+            return 0
+        }
+    }
+    expect -re "$PROMPT"
+    if {$ok && $want ne "" && $got ne $want} {
+        puts "\n!!! asked for migrate=$want but the board reports $got."
+        puts "!!! Refusing to measure - this half would not be the half it claims to be."
+        return 0
+    }
+    if {$ok} { puts "\n===== switch confirmed $got" }
+    return $ok
+}
+
+# 008: put L2_Replacement in a named position and CONFIRM it from sbc_read's own read-back.
+# Returns 1 on success, 0 if the session must not proceed.
+proc set_policy {want} {
+    global PROMPT
+    if {![board_cmd "./sbc_read --policy=$want"]} { return 0 }
+    set timeout 180
+    set got ""
+    expect {
+        -re {L2_Replacement read back} {
+            puts "\n!!! L2_Replacement did not take - PLRU is not built into this bitstream."
+            return 0
+        }
+        -re {policy *: *(random|plru)} { set got $expect_out(1,string) }
+        timeout {
+            puts "\n!!! sbc_read never reported a policy - is it older than task 008?"
+            return 0
+        }
+    }
+    expect -re "$PROMPT"
+    if {$got ne $want} {
+        puts "\n!!! asked for policy=$want but the board reports $got. Refusing to measure."
+        return 0
+    }
+    puts "\n===== policy confirmed $got"
+    return 1
+}
+
+# Run the whole measured set once. Both halves of the A/B call this with an identical WORKLOADS
+# list - if that ever stops being true the comparison is worthless.
+proc run_phase {label} {
+    global WORKLOADS WORK_TMO POLL PROMPT
+    puts "\n=================================================================="
+    puts "===== PHASE $label"
+    puts "=================================================================="
+    foreach w $WORKLOADS {
+        if {$POLL > 0} {
+            puts "\n----- \[$label\] $w   (zero once, then ./sbc_read every ${POLL}s)"
+            if {![board_cmd "./sbc_read --zero > /dev/null"]} { return 0 }
+            expect -re "$PROMPT"
+            if {![board_cmd "$w & echo \$! > /tmp/wpid"]} { return 0 }
+            expect -re "$PROMPT"
+            if {![board_cmd "while kill -0 \$(cat /tmp/wpid) 2>/dev/null; do ./sbc_read; sleep $POLL; done"]} { return 0 }
+            set timeout $WORK_TMO
+            expect -re "$PROMPT"
+            puts "\n----- \[$label\] final reading"
+            if {![board_cmd "./sbc_read"]} { return 0 }
+            expect -re "$PROMPT"
+        } else {
+            puts "\n----- \[$label\] $w"
+            if {![board_cmd $w]} { return 0 }
+            set timeout $WORK_TMO
+            expect {
+                -re {\[SBC-(WINDOW|COUNTERS|ZEROED|DELTA)\]} { }
+                timeout { puts "\n!!! workload timed out after ${WORK_TMO}s: $w" }
+            }
+            set timeout 60
+            expect -re "$PROMPT"
+        }
+    }
+    return 1
+}
+
+# ----------------------------------------------------------------------------- 1. program
+if {$DO_PROG} {
+    puts "===== \[1/5\] programming FPGA (Vivado, a few minutes) ..."
+    set timeout 900
+    spawn bash "$SCRIPTS/programFPGA.sh" $BIT
+    expect {
+        "FPGA programming complete!"  { puts "\n===== FPGA programmed." }
+        "ERROR"                       { puts "\n!!! Vivado error - see transcript"; exit 1 }
+        timeout                       { puts "\n!!! timeout programming FPGA"; exit 1 }
+        eof                           { puts "\n!!! programFPGA.sh exited early"; exit 1 }
+    }
+    catch { expect eof }
+} else {
+    puts "===== \[1/5\] skipping FPGA programming (-noprog)"
+}
+
+# ----------------------------------------------------------------------------- 2. serial
+puts "===== \[2/5\] opening serial console ..."
+set timeout 60
+
+if {$VIA_SCRIPT} {
+    spawn bash "$SCRIPTS/connect_serial.sh"
+    expect {
+        -re {\[sudo\] password for} {
+            if {[info exists env(SUDO_PASS)]} {
+                send "$env(SUDO_PASS)\r"; exp_continue
+            } else {
+                puts "\n!!! sudo wants a password inside the spawned pty (timestamps are per-tty)."
+                puts "!!! Drop -viascript to use the direct path (no sudo), or set SUDO_PASS."
+                exit 1
+            }
+        }
+        "Enable logging?"        { send "n\r"; exp_continue }
+        "Enter choice (1-3):"    { send "1\r" }
+        "Error:"                 { puts "\n!!! serial device problem"; exit 1 }
+        timeout                  { puts "\n!!! timeout starting picocom"; exit 1 }
+    }
+} else {
+    if {![file exists $DEVICE]} {
+        puts "\n!!! $DEVICE not present. Check `ls /dev/ttyUSB*`."
+        exit 1
+    }
+    catch { exec pkill -f "picocom.*ttyUSB" }
+    spawn picocom -b $BAUD --send-cmd $SEND_CMD --receive-cmd $RECV_CMD $DEVICE
+}
+
+expect {
+    "Terminal ready"         { puts "\n===== picocom up." }
+    -re "cannot open|Device or resource busy|No such file" {
+        puts "\n!!! picocom could not open $DEVICE (busy or missing)"; exit 1
+    }
+    timeout                  { puts "\n!!! picocom never became ready"; exit 1 }
+}
+
+# ----------------------------------------------------------------------------- 3. login
+puts "===== \[3/5\] waiting for Linux (banner: Welcome to Buildroot) ..."
+set timeout $BOOT_TMO
+send "\r"
+# Login patterns first. The progress patterns below exp_continue, which restarts the timeout,
+# so BOOT_TMO means "no output for this long", not "boot must finish in this long".
+# Deliberately NOT a catch-all like -re ".+": that always matches at offset 0 and would beat
+# "login:" every time, since expect prefers the match that starts earliest.
+expect {
+    # The definitive "userspace is up" marker on this br-base image. Reported, then we carry on
+    # to the login prompt that follows it.
+    -re "Welcome to Buildroot" {
+        puts "\n===== Buildroot banner seen - Linux is up."
+        exp_continue
+    }
+    -re "login:"        { send -s "$LOGIN\r"; exp_continue }
+    -re "Password:"     { send -s "$PASSWORD\r"; exp_continue }
+    -re "\n$PROMPT"     { puts "\n===== shell ready." }
+    -re "^$PROMPT"      { puts "\n===== shell ready." }
+    # Progress only - each of these restarts the timeout. The banner may never appear when the
+    # board is ALREADY booted (-noprog), which is why the prompt patterns above still stand alone.
+    -re {\[ *[0-9]+\.[0-9]+\]}          { exp_continue }
+    -re "INIT|CMD|LOADING|BOOT"          { exp_continue }
+    -re "Linux version|Starting"         { exp_continue }
+    -re "Kernel panic|Oops:|Unable to mount" {
+        puts "\n!!! kernel failed to boot - see the transcript"; exit 1
+    }
+    timeout {
+        puts "\n!!! no output for ${BOOT_TMO}s - the board looks stuck, not slow."
+        puts "!!! If it was still booting, raise it:  -boottmo 3600"
+        exit 1
+    }
+}
+
+# ----------------------------------------------------------------------------- 4. transfer
+puts "===== \[4/5\] transferring files ..."
+foreach f $PUSH_FILES {
+    if {![file exists $f]} { puts "\n!!! missing: $f"; exit 1 }
+    set base [file tail $f]
+    set hsize [file size $f]
+    puts "\n----- $base ($hsize bytes)"
+    # rz -E RENAMES rather than overwrites: a second push leaves the OLD file as $base and the
+    # new one as $base.0, so ./$base would silently run the stale binary. Clear both first.
+    set timeout 60
+    if {![board_cmd "rm -f $base $base.\[0-9\]* ; ls $base 2>/dev/null || echo GONE"]} { exit 1 }
+    expect {
+        -re "GONE"       { puts "      (no previous copy)" }
+        -re "$base"      { puts "      !!! could not remove the old $base"; exit 1 }
+        timeout          { }
+    }
+    expect -re "$PROMPT"
+    set timeout 30
+    if {![board_cmd "rz -vv -b -E" 30]} { exit 1 }
+    expect {
+        -re "rz waiting|\\*\\*B0|ZMODEM" { }
+        timeout { puts "\n(note: no rz banner seen, sending anyway)" }
+    }
+    send "\x01\x13"
+    expect {
+        -re "file:" { send -s "$f\r" }
+        timeout     { puts "\n!!! picocom never showed the file prompt"; exit 1 }
+    }
+    set timeout 900
+    expect {
+        -re "exit status: 0"        { puts "\n===== $base OK." }
+        -re "exit status: \[1-9\]"  { puts "\n!!! sz failed for $base"; exit 1 }
+        timeout                     { puts "\n!!! transfer timed out: $base"; exit 1 }
+    }
+    set timeout 60
+    expect -re "$PROMPT"
+    if {![board_cmd "chmod +x $base"]} { exit 1 }
+    expect -re "$PROMPT"
+    # Verify size against the host file: catches a truncated transfer, and catches the case
+    # where -E renamed anyway and we are looking at an older copy.
+    if {![board_cmd "wc -c < $base"]} { exit 1 }
+    expect {
+        -re "(\[0-9\]+)\s" {
+            set bsize $expect_out(1,string)
+            if {$bsize == $hsize} {
+                puts "      size OK ($bsize)"
+            } else {
+                puts "      !!! size mismatch: host $hsize, board $bsize - transfer is bad"
+                exit 1
+            }
+        }
+        timeout { puts "      (could not read back size)" }
+    }
+    expect -re "$PROMPT"
+}
+
+# ------------------------------------------------------------------ 4b. which bitstream IS this?
+# Catches the -noprog trap of measuring whatever bitstream happened to be loaded rather than the
+# one you meant.
+#
+# This USED to key on "migrations>0 or parked>0", which task 006 broke: SBC_MigrateEnable defaults
+# OFF at reset, so a freshly booted SBC bitstream reports migrations=0 parked=0 - indistinguishable
+# from NoSBC. sbc_read's `migrate:` line is structural instead (it reads SBC_Status bit0, fixed at
+# elaboration), so it says what was BUILT regardless of what the switch is doing:
+#     n/a      -> SetBalanceUnit not elaborated  = NoSBC bitstream
+#     OFF / ON -> SBC bitstream, switch in that position
+puts "\n===== identifying the loaded bitstream ..."
+set timeout 60
+if {![board_cmd "./sbc_read"]} { exit 1 }
+set parked    -1
+set migs      -1
+set sbc_built -1
+set found_policy "unknown"
+expect {
+    -re {migrate *: *n/a}      { set sbc_built 0; exp_continue }
+    -re {policy *: *(random|plru)} { set found_policy $expect_out(1,string); exp_continue }
+    -re {migrate *: *(ON|OFF)} { set sbc_built 1; exp_continue }
+    -re {migrations=([0-9]+).*parked=([0-9]+)} {
+        set migs   $expect_out(1,string)
+        set parked $expect_out(2,string)
+        exp_continue
+    }
+    -re "$PROMPT" { }
+    timeout { puts "\n!!! could not read counters" }
+}
+
+if {$sbc_built >= 0} {
+    set DETECTED [expr {$sbc_built ? "SBC" : "NoSBC"}]
+    puts "\n===== board reports migrations=$migs parked=$parked, SBC built-in=$sbc_built -> $DETECTED"
+} else {
+    # No `migrate:` line: an sbc_read older than task 006. Fall back to the old heuristic and say so,
+    # because that heuristic now has a false "NoSBC" answer in it.
+    set DETECTED [expr {(($migs > 0) || ($parked > 0)) ? "SBC" : "NoSBC"}]
+    puts "\n===== board reports migrations=$migs parked=$parked -> $DETECTED"
+    puts "!!! NOTE: no 'migrate:' line from sbc_read - this is a pre-006 binary. Falling back to the"
+    puts "!!! counter heuristic, which calls a freshly-booted SBC bitstream 'NoSBC'. Push a current"
+    puts "!!! sbc_read to make this reliable."
+}
+set looks_sbc [expr {$DETECTED eq "SBC"}]
+
+if {$WANT_SBC >= 0 && (($WANT_SBC == 1) != $looks_sbc)} {
+    set asked [expr {$WANT_SBC == 1 ? "SBC" : "NoSBC"}]
+    if {$DO_PROG} {
+        # We just programmed this board, so a mismatch means the wrong bitstream went on -
+        # that is a real failure and worth stopping for.
+        puts "!!! ------------------------------------------------------------------"
+        puts "!!! Asked for $asked, but the board reports $DETECTED right after programming."
+        puts "!!! The wrong bitstream is loaded. Stopping."
+        puts "!!! ------------------------------------------------------------------"
+        send "\x01\x18"; expect eof; exit 1
+    } else {
+        # -noprog means "use whatever is on the board" - that is the user's call, so say what
+        # is really there and carry on. The results are labelled $DETECTED, not $asked.
+        puts "!!! NOTE: -noprog and the loaded bitstream is $DETECTED, not the $asked you named."
+        puts "!!! Continuing. THIS RUN MEASURES $DETECTED - label the results accordingly."
+    }
+}
+puts "===== measuring: $DETECTED"
+
+# 008: the victim policy, set before any measured half. SBC_Reset does not touch it.
+if {$POLICY ne ""} {
+    if {![set_policy $POLICY]} {
+        puts "\n!!! could not set policy=$POLICY. Stopping."
+        send "\x01\x18"; expect eof; exit 1
+    }
+    set POLICY_USED $POLICY
+} else {
+    puts "===== policy left as found: $found_policy"
+    set POLICY_USED $found_policy
+}
+
+# ----------------------------------------------------------------------------- 5. setup + measure
+puts "\n===== \[5/5\] setup (idempotent, not measured) ..."
+foreach c $SETUP {
+    puts "\n----- $c"
+    if {![board_cmd $c $SETUP_TMO]} { exit 1 }
+    set timeout $SETUP_TMO
+    expect -re "$PROMPT"
+}
+
+# A failed cp inside a `||` guard is silent, so prove the benchmark actually landed.
+# Marker is `rc=$?` in the command but `rc=0`/`rc=1` in the output - so the echo of the
+# command itself cannot be mistaken for the result.
+puts "\n----- verifying $OMNET_SET"
+if {![board_cmd "test -x $STAGE/$OMNET_SET/$OMNET_BIN ; echo rc=\$?"]} { exit 1 }
+expect {
+    -re "rc=0" { puts "===== $OMNET_SET/$OMNET_BIN present." }
+    -re "rc=\[1-9\]" {
+        puts "!!! $STAGE/$OMNET_SET/$OMNET_BIN is missing."
+        puts "!!! Is $SRC_DIR mounted, and is the input-set name right?"
+        send "\x01\x18"; expect eof; exit 1
+    }
+    timeout { puts "!!! could not verify the benchmark"; exit 1 }
+}
+expect -re "$PROMPT"
+
+proc bail {msg} {
+    global LOGPATH
+    puts "\n!!! $msg"
+    puts "!!! transcript: $LOGPATH"
+    send "\x01\x18"
+    expect eof
+    exit 1
+}
+
+if {$AB_MODE} {
+    if {!$looks_sbc} {
+        bail "A/B mode needs the SBC bitstream, but the board reports $DETECTED. Use -nosbc for a\n!!! single-phase control run, or program the SBC bitstream."
+    }
+
+    puts "\n===== one-bitstream A/B. Same silicon, same clock, same routing for both halves."
+    puts "===== Phase 1 runs with migration OFF, which parks nothing - that is what makes"
+    puts "===== --reset-all legal before phase 2. The reverse order would need a reboot."
+
+    # Phase 1 - plain-L2 half. Set the switch explicitly rather than trusting the reset default:
+    # with -noprog the board may have been left ON by an earlier session.
+    if {![set_switch "--migrate=off"]}  { bail "could not put the switch in the OFF position" }
+    if {![run_phase "1/2  migrate OFF  (plain-L2 half)"]} { bail "phase 1 failed" }
+
+    # Phase 2 - SBC half. --reset-all drops the heat the saturation counters built up during phase 1
+    # and boot; without it the first migrations fire from stale heat rather than from the benchmark.
+    # It is safe here for exactly one reason: phase 1 parked nothing. sbc_read re-checks that itself.
+    if {![set_switch "--reset-all --migrate=on"]} { bail "could not start the SBC half cleanly" }
+    if {![run_phase "2/2  migrate ON   (SBC half)"]}  { bail "phase 2 failed" }
+
+    # An SBC half that migrated nothing measured the same thing as phase 1, so the comparison is
+    # empty. Better to say so than to let two identical-looking result sets be written up as an A/B.
+    puts "\n===== confirming the SBC half actually migrated ..."
+    set timeout 120
+    if {![board_cmd "./sbc_read"]} { bail "could not read the final counters" }
+    set migs_end -1
+    set parked_end -1
+    expect {
+        -re {migrations=([0-9]+).*parked=([0-9]+)} {
+            set migs_end   $expect_out(1,string)
+            set parked_end $expect_out(2,string)
+            exp_continue
+        }
+        -re "$PROMPT" { }
+        timeout { puts "!!! could not read the final counters" }
+    }
+    if {$migs_end == 0} {
+        puts "\n!!! -----------------------------------------------------------------"
+        puts "!!! The SBC half committed ZERO migrations, so both halves measured the"
+        puts "!!! same thing and this A/B is empty. Check that the workload actually"
+        puts "!!! stresses a set, and check T_hi/T_lo for this geometry."
+        puts "!!! -----------------------------------------------------------------"
+    } else {
+        puts "===== SBC half committed $migs_end migrations, $parked_end line(s) still parked."
+    }
+
+    # Leave the board in the default state, so the next session starts where a fresh boot would.
+    # Cosmetic only - it cannot un-park what phase 2 parked, which is why a repeat needs a reboot.
+    catch { set_switch "--migrate=off" }
+    puts "\n===== switch returned to OFF. NOTE: phase 2's parked lines are still resident -"
+    puts "===== reboot before any run that needs a genuinely cold cache."
+} else {
+    # Single phase. On the SBC bitstream this is the migrate-ON run: --reset-all zeroes the SBC
+    # state (counters, AT, DSS, saturation) so the first migrations fire from the benchmark and
+    # not from heat left over by Linux boot and the file copy, and --migrate=on opens the gate.
+    # sbc_read refuses --reset-all if any line is still parked, which is why this needs a fresh
+    # boot; set_switch turns that refusal into a clean bail rather than a bad measurement.
+    # On the NoSbc bitstream there is no switch to set, so leave it alone (-nosbc / -bit).
+    if {$WANT_SBC == 1} {
+        puts "\n===== arming: reset SBC state, then migration ON ..."
+        if {![set_switch "--reset-all --migrate=on"]} { bail "could not arm the SBC run" }
+        set phase_label "single  ($DETECTED)  migrate ON"
+    } else {
+        puts "\n===== switch left as found (not an SBC bitstream)"
+        set phase_label "single  ($DETECTED)  switch as found"
+    }
+    if {![run_phase $phase_label]} { bail "measurement failed" }
+
+    # Did migration actually engage? A run with zero commits measured plain L2 under an SBC name.
+    puts "\n===== confirming migration actually engaged ..."
+    set timeout 120
+    if {$WANT_SBC == 1 && [board_cmd "./sbc_read"]} {
+        expect {
+            -re {migrations=([0-9]+).*parked=([0-9]+)} {
+                if {$expect_out(1,string) == 0} {
+                    puts "\n!!! ZERO migrations committed - this was not an SBC run in any"
+                    puts "!!! meaningful sense. Check T_hi/T_lo and that the workload stresses a set."
+                } else {
+                    puts "\n===== $expect_out(1,string) migrations, $expect_out(2,string) line(s) parked."
+                }
+                exp_continue
+            }
+            -re "$PROMPT" { }
+            timeout { puts "!!! could not read the final counters" }
+        }
+    }
+}
+
+puts "\n===== done. leaving picocom (Ctrl-A Ctrl-X)."
+send "\x01\x18"
+expect eof
+
+if {$AB_MODE} {
+    puts "\n===== measured: one-bitstream A/B on $DETECTED - phase 1 migrate OFF, phase 2 migrate ON, policy $POLICY_USED"
+    puts "===== Compare the two \[SBC-WINDOW\] blocks above. Quote reads and writes separately."
+} else {
+    puts "\n===== measured config: $DETECTED, policy $POLICY_USED"
+}
+puts "===== transcript: $LOGPATH"

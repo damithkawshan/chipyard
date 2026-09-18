@@ -11,8 +11,25 @@ then
     sudo apt install -y picocom
 fi
 
-DEVICE="/dev/ttyUSB1"
+# sz/rz are what picocom shells out to for file transfer (Ctrl-A Ctrl-S / Ctrl-A Ctrl-R).
+if ! command -v sz &> /dev/null || ! command -v rz &> /dev/null
+then
+    echo "lrzsz (sz/rz) could not be found, installing..."
+    sudo apt update
+    sudo apt install -y lrzsz
+fi
+
+DEVICE="/dev/ttyUSB2"
 BAUDRATE="115200"
+
+# ZMODEM file transfer, wired into picocom's Ctrl-A Ctrl-S (send) / Ctrl-A Ctrl-R (receive).
+# The board already ships sz/rz - br-base's buildroot config sets BR2_PACKAGE_LRZSZ=y.
+#   -b        binary mode. Mandatory: without it an ELF gets mangled by newline translation.
+#   -w / -L   small window and packet. This UART has no RTS/CTS, so zmodem's default window
+#             overruns the FIFO. Shrinking it is what makes the transfer stable.
+#   -E        rz: do not clobber, rename if the file already exists.
+# An array, not a string: each --send-cmd value must reach picocom as ONE argument.
+XFER_OPTS=(--send-cmd "sz -vv -b -w 1024 -L 128" --receive-cmd "rz -vv -b -E")
 LOGDIR="$(dirname "$0")/../logs"
 LOGFILE="${LOGDIR}/uart_$(date +%Y%m%d_%H%M%S).log"
 
@@ -60,11 +77,14 @@ read -p "Enter choice (1-3): " choice
 
 case $choice in
     1)
-        echo "Starting picocom... (Ctrl+A, Ctrl+X to exit)"
-        picocom -b $BAUDRATE $LOG_OPTS $DEVICE
+        echo "Starting picocom..."
+        echo "  Ctrl-A Ctrl-X  quit"
+        echo "  Ctrl-A Ctrl-S  send a file to the board   (run 'rz -b -E' there first)"
+        echo "  Ctrl-A Ctrl-R  pull a file from the board (run 'sz -b <file>' there first)"
+        picocom -b $BAUDRATE $LOG_OPTS "${XFER_OPTS[@]}" $DEVICE
         ;;
     2)
-        echo "Starting screen... (Ctrl+A, K to exit)"
+        echo "Starting screen... (Ctrl+A, K to exit). Note: no rz/sz file transfer - use picocom for that."
         if [ -n "$LOG_OPTS" ]; then
             echo "Logging via 'script' wrapper..."
             script -f "$LOGFILE" -c "screen $DEVICE $BAUDRATE"
@@ -85,7 +105,7 @@ case $choice in
         fi
         ;;
     *)
-        echo "Invalid choice. Using picocom..."
-        picocom -b $BAUDRATE $LOG_OPTS $DEVICE
+        echo "Invalid choice. Using picocom (Ctrl-A Ctrl-S send, Ctrl-A Ctrl-R receive, Ctrl-A Ctrl-X quit)..."
+        picocom -b $BAUDRATE $LOG_OPTS "${XFER_OPTS[@]}" $DEVICE
         ;;
 esac

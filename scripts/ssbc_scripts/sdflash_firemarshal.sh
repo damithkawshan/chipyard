@@ -18,11 +18,17 @@
 #   4. Linux kernel boots. Login: root / fpga
 #
 # Prerequisites:
-#   - FireMarshal br-base-bin-nodisk-flat already built
-#   - Build commands:
+#   - FireMarshal image already built (default: br-base; override with WORKLOAD=)
+#   - Build commands for br-base:
 #       cd $CHIPYARD_DIR/software/firemarshal
-#       ./marshal -v -d build br-base.json
-#       ./marshal -v -d install -t prototype br-base.json
+#       ./marshal -v -d build boards/prototype/base-workloads/br-base.json
+#       ./marshal -v -d install -t prototype boards/prototype/base-workloads/br-base.json
+#   - Build commands for br-base-parsec (PARSEC at /root/parsec):
+#       # First populate: software/firemarshal/example-workloads/br-base-parsec/overlay/root/parsec/
+#       cd $CHIPYARD_DIR/software/firemarshal
+#       ./marshal -v -d build example-workloads/br-base-parsec/br-base-parsec.json
+#       ./marshal -v -d install -t prototype example-workloads/br-base-parsec/br-base-parsec.json
+#       WORKLOAD=br-base-parsec bash sdflash_firemarshal.sh /dev/sdX
 #   - SD card plugged in (partitioning/formatting optional)
 #   - UART connected at 115200 8N1 to see output
 #
@@ -36,7 +42,8 @@ SECTOR=34                             # must match BBL_PARTITION_START_SECTOR in
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CHIPYARD_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
-LINUX_BIN="${CHIPYARD_DIR}/software/firemarshal/images/prototype/br-base/br-base-bin-nodisk-flat"
+WORKLOAD="${WORKLOAD:-br-base}"          # FireMarshal workload name (override via $WORKLOAD)
+LINUX_BIN="${LINUX_BIN:-${CHIPYARD_DIR}/software/firemarshal/images/prototype/${WORKLOAD}/${WORKLOAD}-bin-nodisk-flat}"
 
 # ── 1. Verify the Linux binary exists ──────────────────────────────
 if [ ! -f "$LINUX_BIN" ]; then
@@ -45,8 +52,8 @@ if [ ! -f "$LINUX_BIN" ]; then
     echo ""
     echo "Build it first with FireMarshal:"
     echo "  cd $CHIPYARD_DIR/software/firemarshal"
-    echo "  ./marshal -v -d build br-base.json"
-    echo "  ./marshal -v -d install -t prototype br-base.json"
+    echo "  ./marshal -v -d build ${WORKLOAD}.json"
+    echo "  ./marshal -v -d install -t prototype ${WORKLOAD}.json"
     exit 1
 fi
 
