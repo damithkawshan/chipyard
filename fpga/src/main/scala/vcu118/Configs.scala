@@ -125,6 +125,43 @@ class FPGASingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
   new chipyard.SingleRocketVCU118L18K256K16WL2ConfigNoSbc
 )
 
+class FPGASingleRocketVCU118L18K64K16WL2ConfigSBC extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K64K16WL2ConfigSBC
+)
+
+// Task 008: 64KB SBC + PLRU (L2_Replacement at 0x490, reset = random).
+class FPGASingleRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K64K16WL2ConfigSBCPLRU
+)
+
+class FPGADualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.DualRocketVCU118L18K64K16WL2ConfigSBCPLRU
+)
+
+class FPGASingleRocketVCU118L18K64K16WL2ConfigNoSbc extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K64K16WL2ConfigNoSbc
+)
+
+class FPGASingleRocketVCU118L18K128K16WL2ConfigSBC extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K128K16WL2ConfigSBC
+)
+
+class FPGASingleRocketVCU118L18K128K16WL2ConfigNoSbc extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K128K16WL2ConfigNoSbc
+)
+
 // Paper-geometry L1 pair (2026-09-12) — see RocketConfigs.scala for the rationale. 32KB/8-way L1s,
 // same 256KB/16-way L2 as the 8KB-L1 pair above.
 class FPGASingleRocketVCU118L132K256K16WL2ConfigSBC extends Config(

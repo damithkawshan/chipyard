@@ -198,6 +198,56 @@ class SingleRocketVCU118L18K256K16WL2ConfigNoSbc extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
   new chipyard.config.AbstractConfig)
 
+class SingleRocketVCU118L18K64K16WL2ConfigSBC extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+// Task 008: the 64KB SBC config plus the PLRU tracker. One image gives all four A/B halves at run time:
+// SBC_MigrateEnable (0x3C0) off/on x L2_Replacement (0x490) random/plru.
+class SingleRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class DualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(2) ++
+  new chipyard.config.AbstractConfig)
+
+class SingleRocketVCU118L18K64K16WL2ConfigNoSbc extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
+    enableSetBalancing = false, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class SingleRocketVCU118L18K128K16WL2ConfigSBC extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 128,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class SingleRocketVCU118L18K128K16WL2ConfigNoSbc extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 128,
+    enableSetBalancing = false, sbcShadow = false, sbcDebug = false) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 // ---------------------------------------------------------------------------------------------
 // Paper-geometry L1 pair (2026-09-12): tests whether our low measured miss rates (~4.5%) are an
 // L1/L2 sizing artifact rather than a counter bug. Rolan et al. use a 32kB/8-way L1 behind their
@@ -230,7 +280,7 @@ class VerilatorRocket8KL116KL2Config extends Config(
   new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++  // DCache with 2KB capacity (4 sets × 8 ways × 64B)
   new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
-  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true) ++ // 16KB 8-way L2                                 // 4 Big Rocket cores
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, plruReplacement = true) ++ // 16KB 8-way L2; 008 PLRU                                // 4 Big Rocket cores
   new chipyard.config.AbstractConfig)
 
 // SBC OFF control: identical geometry to VerilatorRocket8KL116KL2Config but set-balancing disabled.
@@ -241,7 +291,7 @@ class VerilatorRocket8KL116KL2NoSbcConfig extends Config(
   new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
   new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
-  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, enableSetBalancing = false) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, enableSetBalancing = false, plruReplacement = true) ++ // 008 PLRU
   new chipyard.config.AbstractConfig)
 
 // SBC shadow-hunt config (003 Amendment 11): the standard VerilatorRocket8KL116KL2Config plus the
