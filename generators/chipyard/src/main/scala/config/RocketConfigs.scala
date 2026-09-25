@@ -216,6 +216,17 @@ class SingleRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
   new chipyard.config.AbstractConfig)
 
+// Same 64 KB capacity, 8 ways instead of 16 -> 128 sets instead of 64. Halving associativity doubles
+// the number of sets, which is the axis the SBC paper's gain lives on (it used 8-way, 4096 sets; our
+// 16-way/64-set build is closer to "already merged" and has less imbalance left to exploit).
+class SingleRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 64,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 class DualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
     sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
@@ -322,6 +333,17 @@ class VerilatorRocket8KL116KL2SipTestConfig extends Config(
   new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
   new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, sbcForceDstSet = 6) ++
+  new chipyard.config.AbstractConfig)
+
+// Task 012 V4: the SipTest geometry (pairing pinned 5<->6) plus PLRU, so the destination write-back of
+// a dirty GUEST can be driven (sw/dirty_guest_evict_test.c). SipTestConfig has no L2_Replacement register.
+class VerilatorRocket8KL116KL2SipTestPlruConfig extends Config(
+  new freechips.rocketchip.rocket.WithL1ICacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(2) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(2) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 4, subBankingFactor = 2, sbcAutoMigrate = true, sbcShadow = true, sbcDebug = true, sbcForceDstSet = 6, plruReplacement = true) ++
   new chipyard.config.AbstractConfig)
 
 // SBC serve-in-place DUAL-core test config (003 §10.6 S3/S4): two big cores so a SECOND probe-capable

@@ -138,6 +138,13 @@ class FPGASingleRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new chipyard.SingleRocketVCU118L18K64K16WL2ConfigSBCPLRU
 )
 
+// 64 KB but 8-way -> 128 sets. More sets, lower associativity: closer to the paper's geometry.
+class FPGASingleRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K64K8WL2ConfigSBCPLRU
+)
+
 class FPGADualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new WithFPGAFreq50MHz ++
   new WithVCU118Tweaks ++
