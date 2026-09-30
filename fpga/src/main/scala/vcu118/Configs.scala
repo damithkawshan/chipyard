@@ -171,6 +171,13 @@ class FPGASingleRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
   new chipyard.SingleRocketVCU118L18K1M8WL2ConfigSBCPLRU
 )
 
+// 013: single core, 1 MB 8-way L2, 32 kB 8-way L1 (the paper's L1).
+class FPGASingleRocketVCU118L132K1024K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L132K1024K8WL2ConfigSBCPLRU
+)
+
 // Dual-core 1024 KB (1 MB) 8-way (2048 sets) SBC+PLRU
 class FPGADualRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
   new WithFPGAFreq50MHz ++

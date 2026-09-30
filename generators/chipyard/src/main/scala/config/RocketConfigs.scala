@@ -258,6 +258,18 @@ class SingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
 class SingleRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
   new SingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU)
 
+// 1 MB 8-way L2 (2048 sets) with the paper's L1: 32 kB 8-way (64 sets x 8 ways x 64 B), single core.
+// Same L1 lines as DualRocketVCU118L18K1024K8WL2ConfigSBCPLRU, so single vs dual differs only in cores.
+class SingleRocketVCU118L132K1024K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 1024,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(8) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(64) ++
+  new freechips.rocketchip.rocket.WithL1ICacheWays(8) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(64) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 // Dual-core 1024 KB (1 MB) 8-way (2048 sets) SBC+PLRU
 class DualRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 1024,
