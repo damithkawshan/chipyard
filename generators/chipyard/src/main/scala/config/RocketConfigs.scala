@@ -227,6 +227,18 @@ class SingleRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(1) ++
   new chipyard.config.AbstractConfig)
 
+// 256 KB 8-way L2 -> 512 sets (512 * 8 * 64B = 256 KB). Fills the gap between the 64 KB and 1 MB
+// 8-way envelope points (board-calib-envelope-8way-*). 8-way, not 16: every 256 KB config in this
+// repo so far is 16-way (256 sets), which is B7-2 - Vivado DRC refuses write_bitstream with a
+// combinational loop (bug-fix-log.md). 8-way has a different set count and has not hit that bug.
+class SingleRocketVCU118L18K256K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 256,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
 class DualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
     sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++

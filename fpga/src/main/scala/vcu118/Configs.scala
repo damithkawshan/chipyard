@@ -145,6 +145,12 @@ class FPGASingleRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
   new chipyard.SingleRocketVCU118L18K64K8WL2ConfigSBCPLRU
 )
 
+class FPGASingleRocketVCU118L18K256K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K256K8WL2ConfigSBCPLRU
+)
+
 class FPGADualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new WithFPGAFreq50MHz ++
   new WithVCU118Tweaks ++
