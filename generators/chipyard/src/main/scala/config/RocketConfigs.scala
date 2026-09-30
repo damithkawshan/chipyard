@@ -235,6 +235,43 @@ class DualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new freechips.rocketchip.rocket.WithNBigCores(2) ++
   new chipyard.config.AbstractConfig)
 
+// Dual-core 64 KB 8-way (128 sets) SBC+PLRU. Matches the single-core 8-way geometry but with
+// 2 cores, so SBC operates on twice the access pressure — useful for multi-core SBC sensitivity.
+class DualRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 64,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(32) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(32) ++
+  new freechips.rocketchip.rocket.WithNBigCores(2) ++
+  new chipyard.config.AbstractConfig)
+
+// 1024 KB (1 MB) 8-way L2 -> 2048 sets (2048 * 8 * 64B = 1 MB).
+// Matches the Rolan et al. SBC evaluation geometry (8-way, large set count) with SBC+PLRU.
+class SingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 1024,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheSets(128) ++
+  new freechips.rocketchip.rocket.WithL1ICacheSets(128) ++
+  new freechips.rocketchip.rocket.WithNBigCores(1) ++
+  new chipyard.config.AbstractConfig)
+
+class SingleRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
+  new SingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU)
+
+// Dual-core 1024 KB (1 MB) 8-way (2048 sets) SBC+PLRU
+class DualRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
+  new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 8, capacityKB = 1024,
+    sbcAutoMigrate = true, sbcShadow = false, sbcDebug = false, plruReplacement = true) ++
+  new freechips.rocketchip.rocket.WithL1DCacheWays(8) ++ // Increase to 8 ways
+  new freechips.rocketchip.rocket.WithL1DCacheSets(64) ++ // 64 sets * 64B = 4KB per way
+  new freechips.rocketchip.rocket.WithL1ICacheWays(8) ++ 
+  new freechips.rocketchip.rocket.WithL1ICacheSets(64) ++ 
+  new freechips.rocketchip.rocket.WithNBigCores(2) ++
+  new chipyard.config.AbstractConfig)
+
+class DualRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
+  new DualRocketVCU118L18K1024K8WL2ConfigSBCPLRU)
+
 class SingleRocketVCU118L18K64K16WL2ConfigNoSbc extends Config(
   new freechips.rocketchip.subsystem.WithInclusiveCache(nWays = 16, capacityKB = 64,
     enableSetBalancing = false, sbcShadow = false, sbcDebug = false) ++

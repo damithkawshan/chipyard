@@ -151,6 +151,39 @@ class FPGADualRocketVCU118L18K64K16WL2ConfigSBCPLRU extends Config(
   new chipyard.DualRocketVCU118L18K64K16WL2ConfigSBCPLRU
 )
 
+// Dual-core 64 KB 8-way (128 sets) SBC+PLRU.
+class FPGADualRocketVCU118L18K64K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.DualRocketVCU118L18K64K8WL2ConfigSBCPLRU
+)
+
+// 1024 KB (1 MB) 8-way (2048 sets) SBC+PLRU
+class FPGASingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU
+)
+
+class FPGASingleRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.SingleRocketVCU118L18K1M8WL2ConfigSBCPLRU
+)
+
+// Dual-core 1024 KB (1 MB) 8-way (2048 sets) SBC+PLRU
+class FPGADualRocketVCU118L18K1024K8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.DualRocketVCU118L18K1024K8WL2ConfigSBCPLRU
+)
+
+class FPGADualRocketVCU118L18K1M8WL2ConfigSBCPLRU extends Config(
+  new WithFPGAFreq50MHz ++
+  new WithVCU118Tweaks ++
+  new chipyard.DualRocketVCU118L18K1M8WL2ConfigSBCPLRU
+)
+
 class FPGASingleRocketVCU118L18K64K16WL2ConfigNoSbc extends Config(
   new WithFPGAFreq50MHz ++
   new WithVCU118Tweaks ++
