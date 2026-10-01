@@ -30,6 +30,8 @@
 #   ./run_parsec_session.exp -tmo 1800            # workload timeout in seconds
 #   ./run_parsec_session.exp -threads 1           # pthread count passed to each benchmark
 #   ./run_parsec_session.exp -bench blackscholes,swaptions   # subset (default: all five)
+#   ./run_parsec_session.exp -policy plru         # L2_Replacement resets to random on every
+#                                                  # reprogram; set explicitly or that is what runs
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Configuration
@@ -59,6 +61,7 @@ set SKIP_PUSH    0
 set DO_INTERACT  0
 set NTHREADS     2
 set BENCH_FILTER ""
+set POLICY       ""
 
 # Every entry: {name exe {extra files} run_cmd}. Args are PARSEC's own simdev.runconf values
 # (pkgs/*/parsec/simdev.runconf), except canneal's netlist name, which is adapted to what is staged
@@ -84,6 +87,7 @@ for {set i 0} {$i < $argc} {incr i} {
         "-tmo"       { incr i; set WORK_TMO [lindex $argv $i] }
         "-threads"   { incr i; set NTHREADS [lindex $argv $i] }
         "-bench"     { incr i; set BENCH_FILTER [lindex $argv $i] }
+        "-policy"    { incr i; set POLICY [lindex $argv $i] }
         default      { puts "unknown arg: $a"; exit 2 }
     }
 }
@@ -453,6 +457,15 @@ expect {
     timeout                        { puts "\n(warning: sbc_read status read timed out)" }
 }
 puts "===== SBC built: $sbc_built, policy: $found_policy"
+
+# The hardware's L2_Replacement register resets to 0 (random) on every FPGA reprogram, even when the
+# bitstream was built with plruReplacement=true - it must be set explicitly every session, it does not
+# follow from the bitstream alone. Omitting -policy here silently runs under random replacement.
+if {$POLICY ne ""} {
+    puts "===== Setting policy=$POLICY ..."
+    board_cmd "/root/sbc_read --policy=$POLICY"
+    expect -re "$PROMPT"
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # STEP 5: Run benchmarks with A/B migration evaluation
