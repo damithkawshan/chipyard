@@ -1,0 +1,525 @@
+#!/usr/bin/expect --
+#
+# run_parsec_session.exp - Full pipeline for PARSEC benchmark evaluation on VCU118.
+#
+# Replaces the previous version of this script, which never programmed the FPGA or booted/mounted
+# anything (it assumed a live session was already up) and detected a workload's completion from the
+# [SBC-WINDOW] line alone, with no exp_continue to the "workload rc=" echo that follows it. That is a
+# race: a single-shot `expect` can return on a stale or partial buffer match before the child process
+# actually exited, truncating the measured window. The 2026-09-30 PARSEC report (accessA down 33-45%
+# between the OFF and ON phases of the SAME binary and input) is the symptom - a same-work violation,
+# not an SBC effect. Fixed here by following run_benchmarks_session.exp's pattern: exp_continue through
+# BOTH the [SBC-WINDOW] line and the "workload rc=" echo, then wait for the prompt, and refuse to report
+# a window if either marker was never seen. Arguments for canneal and bodytrack are taken from PARSEC's
+# own pkgs/*/parsec/simdev.runconf, not re-guessed.
+#
+# Steps:
+#   1. Program FPGA bitstream via Vivado
+#   2. Boot Linux on VCU118, wait for shell
+#   3. Mount SD card, copy sbc_read and other tools
+#   4. Transfer PARSEC benchmark binaries + inputs via zmodem (idempotent: board -> /mnt cache -> zmodem)
+#   5. Run each benchmark with migration OFF (baseline) then migration ON (SBC active), same binary
+#      and input both times
+#   6. Collect all L2/memory performance counters and report
+#
+# Usage:
+#   ./run_parsec_session.exp -bit /path/to/bitfile.bit
+#   ./run_parsec_session.exp -noprog              # skip FPGA programming (already loaded)
+#   ./run_parsec_session.exp -skippush            # skip file transfers (already on board)
+#   ./run_parsec_session.exp -interact            # stay in picocom after completion
+#   ./run_parsec_session.exp -tmo 1800            # workload timeout in seconds
+#   ./run_parsec_session.exp -threads 1           # pthread count passed to each benchmark
+#   ./run_parsec_session.exp -bench blackscholes,swaptions   # subset (default: all five)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ──────────────────────────────────────────────────────────────────────────────
+set CY          "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
+set SCRIPTS     "$CY/scripts/ssbc_scripts"
+set SW_DIR      "$CY/generators/rocket-chip-inclusive-cache/sw"
+set STAGED      "$CY/software/parsec-benchmark/staged"
+set DEFAULT_BIT "$CY/fpga/bitstream_storage/FPGASingleRocketVCU118L18K256K8WL2ConfigSBCPLRU-256KB-8way-candidate013-2026-10-01-2026-10-01.bit"
+
+set DEVICE      "/dev/ttyUSB2"
+set BAUD        "115200"
+set SEND_CMD    "sz -vv -b -w 1024 -L 128"
+set RECV_CMD    "rz -vv -b -E"
+set LOGIN       "root"
+set PASSWORD    "fpga"
+set PROMPT      "# "
+set BOOT_TMO    1800
+set WORK_TMO    1800
+
+set send_slow   {1 .008}
+
+# Defaults
+set BIT          $DEFAULT_BIT
+set DO_PROG      1
+set SKIP_PUSH    0
+set DO_INTERACT  0
+set NTHREADS     2
+set BENCH_FILTER ""
+
+# Every entry: {name exe {extra files} run_cmd}. Args are PARSEC's own simdev.runconf values
+# (pkgs/*/parsec/simdev.runconf), except canneal's netlist name, which is adapted to what is staged
+# (canneal_6k.nets, not PARSEC's own 100.nets - same simdev swap/temp/pass magnitudes).
+set ALL_APPS [list \
+    {blackscholes   blackscholes   {in_16.txt}            "./blackscholes \$NTHREADS in_16.txt prices.txt"} \
+    {swaptions      swaptions      {}                     "./swaptions -ns 3 -sm 50 -nt \$NTHREADS"} \
+    {streamcluster  streamcluster  {}                     "./streamcluster 3 10 3 16 16 10 none output.txt \$NTHREADS"} \
+    {canneal        canneal        {canneal_6k.nets}      "./canneal \$NTHREADS 100 300 canneal_6k.nets 2"} \
+    {bodytrack      bodytrack      {sequenceB_1.tar.gz}   "./bodytrack sequenceB_1 4 1 100 3 0 \$NTHREADS"} \
+]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Parse command line
+# ──────────────────────────────────────────────────────────────────────────────
+for {set i 0} {$i < $argc} {incr i} {
+    set a [lindex $argv $i]
+    switch -- $a {
+        "-bit"       { incr i; set BIT [lindex $argv $i] }
+        "-noprog"    { set DO_PROG 0 }
+        "-skippush"  { set SKIP_PUSH 1 }
+        "-interact"  { set DO_INTERACT 1 }
+        "-tmo"       { incr i; set WORK_TMO [lindex $argv $i] }
+        "-threads"   { incr i; set NTHREADS [lindex $argv $i] }
+        "-bench"     { incr i; set BENCH_FILTER [lindex $argv $i] }
+        default      { puts "unknown arg: $a"; exit 2 }
+    }
+}
+
+set APPS [list]
+if {$BENCH_FILTER eq ""} {
+    set APPS $ALL_APPS
+} else {
+    foreach want [split $BENCH_FILTER ","] {
+        foreach app $ALL_APPS {
+            if {[lindex $app 0] eq $want} { lappend APPS $app }
+        }
+    }
+}
+if {[llength $APPS] == 0} {
+    puts "ERROR: no benchmarks selected (check -bench against: blackscholes swaptions streamcluster canneal bodytrack)"
+    exit 2
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Log setup
+# ──────────────────────────────────────────────────────────────────────────────
+set stamp [clock format [clock seconds] -format "%Y%m%d-%H%M%S"]
+set LOGDIR "$SCRIPTS/../logs"
+catch { file mkdir $LOGDIR }
+set LOGPATH "$LOGDIR/parsec_session_$stamp.log"
+log_file -a $LOGPATH
+
+set bench_names [list]
+foreach app $APPS { lappend bench_names [lindex $app 0] }
+
+puts "\n=================================================================="
+puts "===== PARSEC VCU118 EVALUATION"
+puts "=================================================================="
+puts "===== bitstream      : $BIT"
+puts "===== program FPGA   : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog)}}]"
+puts "===== skip push      : [expr {$SKIP_PUSH ? {yes} : {no}}]"
+puts "===== benchmarks     : [join $bench_names {, }] (threads: $NTHREADS)"
+puts "===== workload timeout: ${WORK_TMO}s"
+puts "===== log            : $LOGPATH"
+puts "==================================================================\n"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
+proc board_cmd {cmd {tmo 60}} {
+    global PROMPT
+    set timeout $tmo
+    send -s "$cmd\r"
+    set probe [string range $cmd 0 59]
+    expect {
+        -ex $probe { return 1 }
+        timeout {
+            puts "\n!!! echo mismatch / timeout sending: $cmd"
+            return 0
+        }
+    }
+}
+
+proc bail {msg} {
+    global LOGPATH
+    puts "\n!!! $msg"
+    puts "!!! transcript: $LOGPATH"
+    send "\x01\x18"
+    expect eof
+    exit 1
+}
+
+proc zmodem_send {filepath} {
+    global PROMPT
+    set base [file tail $filepath]
+    set hsize [file size $filepath]
+    puts "\n----- transferring $base ($hsize bytes) ..."
+
+    set timeout 60
+    if {![board_cmd "rm -f $base $base.\[0-9\]*"]} { bail "failed to clean old $base" }
+    expect -re "$PROMPT"
+
+    set timeout 30
+    if {![board_cmd "rz -vv -b -E" 30]} { bail "failed to launch rz on board for $base" }
+    expect {
+        -re "rz waiting|\\*\\*B0|ZMODEM" { }
+        timeout { puts "(waiting for rz...)" }
+    }
+
+    send "\x01\x13"
+    expect {
+        -re "file:" { send -s "$filepath\r" }
+        timeout     { bail "picocom never prompted for file name ($base)" }
+    }
+
+    set timeout 900
+    expect {
+        -re "exit status: 0"       { puts "\n===== $base transferred successfully." }
+        -re "exit status: \[1-9\]" { bail "sz failed for $base" }
+        timeout                    { bail "transfer timed out for $base" }
+    }
+
+    set timeout 60
+    expect -re "$PROMPT"
+    if {![board_cmd "chmod +x $base"]} { bail "failed chmod $base" }
+    expect -re "$PROMPT"
+
+    if {![board_cmd "wc -c < $base"]} { bail "failed wc -c $base" }
+    expect {
+        -re "(\[0-9\]+)" {
+            set bsize $expect_out(1,string)
+            if {$bsize == $hsize} {
+                puts "      verified size: $bsize bytes matches host"
+            } else {
+                puts "      (read size $bsize, expected $hsize)"
+            }
+        }
+        timeout { puts "      (warning: could not verify size)" }
+    }
+    expect -re "$PROMPT"
+}
+
+# Idempotent: present locally -> present on /mnt/parsec cache -> zmodem from $STAGED. Covers one
+# plain file (an executable or a data file) sitting flat in /root/parsec.
+proc stage_file {relname hostpath {is_exe 1}} {
+    global PROMPT STAGED
+    board_cmd "test -e $relname ; echo check_${relname}=\$?"
+    expect {
+        -re "check_${relname}=0" { expect -re "$PROMPT"; return }
+        -re "check_${relname}=1" { expect -re "$PROMPT" }
+    }
+    board_cmd "test -e /mnt/parsec/$relname && cp /mnt/parsec/$relname . || true"
+    expect -re "$PROMPT"
+    board_cmd "test -e $relname ; echo checkmnt_${relname}=\$?"
+    expect {
+        -re "checkmnt_${relname}=0" {
+            puts "\n===== $relname restored from /mnt/parsec/"
+            expect -re "$PROMPT"
+        }
+        -re "checkmnt_${relname}=1" {
+            expect -re "$PROMPT"
+            zmodem_send "$hostpath"
+        }
+    }
+    if {$is_exe} {
+        board_cmd "chmod +x $relname"
+        expect -re "$PROMPT"
+    }
+}
+
+# Accumulate results for final report
+set results [list]
+
+proc run_benchmark_phase {name cmd mig_state} {
+    global PROMPT WORK_TMO results
+    puts "\n=================================================================="
+    puts "===== RUNNING $name  \[migrate=$mig_state\]"
+    puts "=================================================================="
+
+    set full_cmd "/root/sbc_read --migrate=$mig_state --zero -- sh -c '$cmd 2> wl.err' ; echo \"workload rc=\$?\" ; tail -5 wl.err"
+    puts "----- command: $full_cmd"
+
+    if {![board_cmd "$full_cmd"]} {
+        lappend results [list $name $mig_state "SEND_FAIL" "" ""]
+        return 0
+    }
+
+    set timeout $WORK_TMO
+    set sbc_line ""
+    set sec_hits "?"
+    set workload_rc "?"
+    set saw_rc 0
+    # Both the [SBC-WINDOW] line AND the "workload rc=" echo must be seen (exp_continue on each) before
+    # falling through to the prompt wait below. [SBC-WINDOW] alone is not proof the child exited - see
+    # the file header. sbc_read's own waitpid() guarantees the print follows exit, so the real risk was
+    # the SINGLE-SHOT match returning on a stale/partial buffer read, not sbc_read's ordering.
+    expect {
+        -re {\[SBC-WINDOW\][^\r\n]*} {
+            set sbc_line $expect_out(0,string)
+            puts "\n===== \[SBC-WINDOW\]: $sbc_line"
+            if {[regexp {secHits=(\d+)} $sbc_line -> sh]} { set sec_hits $sh }
+            exp_continue
+        }
+        -re "workload rc=(\\d+)" {
+            set workload_rc $expect_out(1,string)
+            set saw_rc 1
+            puts "===== Workload finished with return code $workload_rc"
+            exp_continue
+        }
+        -re "$PROMPT" {
+            if {!$saw_rc} {
+                puts "\n!!! prompt seen before 'workload rc=' - treating as incomplete, not reporting a window"
+                lappend results [list $name $mig_state "NO_RC_SEEN" "" ""]
+                return 0
+            }
+            puts "===== Benchmark phase finished."
+        }
+        timeout {
+            puts "\n!!! workload timed out after ${WORK_TMO}s"
+            lappend results [list $name $mig_state "TIMEOUT" "" ""]
+            return 0
+        }
+    }
+
+    if {$sbc_line eq ""} {
+        puts "\n!!! no \[SBC-WINDOW\] line seen even though rc=$workload_rc - not reporting a window"
+        lappend results [list $name $mig_state "NO_WINDOW" "" ""]
+        return 0
+    }
+
+    lappend results [list $name $mig_state "OK (rc=$workload_rc)" $sec_hits $sbc_line]
+    return 1
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 1: Program FPGA
+# ──────────────────────────────────────────────────────────────────────────────
+if {$DO_PROG} {
+    if {![file exists $BIT]} {
+        puts "ERROR: Missing bitstream: $BIT"
+        exit 1
+    }
+    puts "===== \[1/5\] Killing any serial processes before FPGA programming ..."
+    catch { exec pkill -f "picocom.*ttyUSB" }
+    catch { exec pkill -f "screen.*ttyUSB" }
+    sleep 1
+
+    puts "===== \[1/5\] Programming FPGA with Vivado (may take a few minutes) ..."
+    set timeout 900
+    spawn bash "$SCRIPTS/programFPGA.sh" $BIT
+    expect {
+        "FPGA programming complete!"  { puts "\n===== FPGA programmed successfully." }
+        "ERROR"                       { puts "\n!!! Vivado error programming FPGA"; exit 1 }
+        timeout                       { puts "\n!!! Vivado programming timed out"; exit 1 }
+        eof                           { puts "\n!!! programFPGA.sh exited"; }
+    }
+    catch { expect eof }
+} else {
+    puts "===== \[1/5\] Skipping FPGA programming (-noprog)"
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 2: Open serial console
+# ──────────────────────────────────────────────────────────────────────────────
+puts "===== \[2/5\] Opening serial console ($DEVICE) ..."
+set timeout 60
+if {![file exists $DEVICE]} {
+    puts "\n!!! $DEVICE not found. Waiting up to 15s for device to appear..."
+    for {set retries 0} {$retries < 15} {incr retries} {
+        sleep 1
+        if {[file exists $DEVICE]} { break }
+    }
+    if {![file exists $DEVICE]} {
+        puts "\n!!! $DEVICE still not present. Check FPGA connection."
+        exit 1
+    }
+}
+
+catch { exec pkill -f "picocom.*ttyUSB" }
+sleep 1
+
+spawn picocom -b $BAUD --send-cmd $SEND_CMD --receive-cmd $RECV_CMD $DEVICE
+expect {
+    "Terminal ready" { puts "\n===== picocom ready." }
+    -re "cannot open|Device or resource busy|No such file" {
+        puts "\n!!! picocom could not open $DEVICE"; exit 1
+    }
+    timeout { puts "\n!!! picocom never became ready"; exit 1 }
+}
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 3: Wait for Linux boot & login
+# ──────────────────────────────────────────────────────────────────────────────
+puts "===== \[3/5\] Waiting for Linux to boot ..."
+set timeout $BOOT_TMO
+send "\r"
+expect {
+    -re "Welcome to Buildroot" { puts "\n===== Buildroot banner detected."; exp_continue }
+    -re "login:"        { send -s "$LOGIN\r"; exp_continue }
+    -re "Password:"     { send -s "$PASSWORD\r"; exp_continue }
+    -re "\n$PROMPT"     { puts "\n===== Shell prompt ready." }
+    -re "^$PROMPT"      { puts "\n===== Shell prompt ready." }
+    -re {\[ *[0-9]+\.[0-9]+\]}          { exp_continue }
+    -re "INIT|CMD|LOADING|BOOT"          { exp_continue }
+    -re "Linux version|Starting"         { exp_continue }
+    -re "Kernel panic|Oops:|Unable to mount" { puts "\n!!! Kernel panic / boot failure"; exit 1 }
+    timeout { puts "\n!!! Timeout (${BOOT_TMO}s) waiting for Linux boot."; exit 1 }
+}
+
+if {![board_cmd "stty sane 2>/dev/null || true"]} { bail "failed stty sane" }
+expect -re "$PROMPT"
+if {![board_cmd "cd /root"]} { bail "failed cd /root" }
+expect -re "$PROMPT"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 4: Mount SD, transfer sbc_read + benchmarks
+# ──────────────────────────────────────────────────────────────────────────────
+puts "\n===== \[4/5\] Mount SD, transfer tools + benchmark binaries ..."
+
+board_cmd "mkdir -p /mnt && if ! grep -q ' /mnt ' /proc/mounts; then if test -b /dev/mmcblk0p2; then mount /dev/mmcblk0p2 /mnt; elif test -b /dev/mmcblk0p1; then mount /dev/mmcblk0p1 /mnt; else mount /dev/mmcblk0 /mnt 2>/dev/null || true; fi; fi"
+expect -re "$PROMPT"
+board_cmd "mkdir -p /root/parsec"
+expect -re "$PROMPT"
+
+if {!$SKIP_PUSH} {
+    board_cmd {test -x /root/sbc_read ; echo check_sbc=$?}
+    expect {
+        -re "check_sbc=0" { expect -re "$PROMPT" }
+        -re "check_sbc=1" {
+            expect -re "$PROMPT"
+            board_cmd "test -x /mnt/sbc_read && cp /mnt/sbc_read /root/ && chmod +x /root/sbc_read || true"
+            expect -re "$PROMPT"
+            board_cmd {test -x /root/sbc_read ; echo check_sbc_mnt=$?}
+            expect {
+                -re "check_sbc_mnt=0" { expect -re "$PROMPT" }
+                -re "check_sbc_mnt=1" {
+                    expect -re "$PROMPT"
+                    zmodem_send "$SW_DIR/build/sbc_read"
+                    board_cmd "cp /root/sbc_read /mnt/ 2>/dev/null || true"
+                    expect -re "$PROMPT"
+                }
+            }
+        }
+    }
+
+    board_cmd "cd /root/parsec"
+    expect -re "$PROMPT"
+
+    foreach app $APPS {
+        set name  [lindex $app 0]
+        set exe   [lindex $app 1]
+        set extra [lindex $app 2]
+
+        puts "\n----- staging $name ..."
+        stage_file $exe "$STAGED/$exe" 1
+        foreach f $extra {
+            if {$f eq "sequenceB_1.tar.gz"} {
+                board_cmd {test -d sequenceB_1 ; echo check_seqb=$?}
+                expect {
+                    -re "check_seqb=0" { expect -re "$PROMPT" }
+                    -re "check_seqb=1" {
+                        expect -re "$PROMPT"
+                        stage_file "sequenceB_1.tar.gz" "$STAGED/sequenceB_1.tar.gz" 0
+                        board_cmd "tar -xzf sequenceB_1.tar.gz"
+                        expect -re "$PROMPT"
+                    }
+                }
+            } else {
+                stage_file $f "$STAGED/$f" 0
+            }
+        }
+    }
+
+    board_cmd "mkdir -p /mnt/parsec && cp -r /root/parsec/* /mnt/parsec/ 2>/dev/null || true"
+    expect -re "$PROMPT"
+    board_cmd "cd /root"
+    expect -re "$PROMPT"
+} else {
+    puts "\n===== \[4/5\] Skipping file push (-skippush)"
+}
+
+puts "\n===== Verifying SBC hardware ..."
+if {![board_cmd "/root/sbc_read"]} { bail "failed to run /root/sbc_read" }
+set sbc_built -1
+set found_policy "unknown"
+expect {
+    -re {migrate *: *(ON|OFF)}     { set sbc_built 1; exp_continue }
+    -re {migrate *: *n/a}          { set sbc_built 0; exp_continue }
+    -re {policy *: *(random|plru)} { set found_policy $expect_out(1,string); exp_continue }
+    -re "$PROMPT"                  { }
+    timeout                        { puts "\n(warning: sbc_read status read timed out)" }
+}
+puts "===== SBC built: $sbc_built, policy: $found_policy"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# STEP 5: Run benchmarks with A/B migration evaluation
+# ──────────────────────────────────────────────────────────────────────────────
+puts "\n===== \[5/5\] Running benchmark evaluation ..."
+board_cmd "cd /root/parsec"
+expect -re "$PROMPT"
+board_cmd "ls -la"
+expect -re "$PROMPT"
+
+foreach app $APPS {
+    set name [lindex $app 0]
+    set exe  [lindex $app 1]
+    set cmd  [subst [lindex $app 3]]
+
+    puts "\n===== Running [string toupper $name] ..."
+    board_cmd "test -x ./$exe && echo '${name}_OK' || echo '${name}_MISSING'"
+    expect {
+        -re "${name}_OK" {
+            expect -re "$PROMPT"
+            if {![run_benchmark_phase "$name (Phase 1: Migrate OFF)" $cmd "off"]} {
+                puts "!!! $name Phase 1 (OFF) failed - continuing"
+            }
+            board_cmd "sleep 2"
+            expect -re "$PROMPT"
+            if {![run_benchmark_phase "$name (Phase 2: Migrate ON)" $cmd "on"]} {
+                puts "!!! $name Phase 2 (ON) failed - continuing"
+            }
+            board_cmd "sleep 2"
+            expect -re "$PROMPT"
+        }
+        -re "${name}_MISSING" {
+            expect -re "$PROMPT"
+            puts "\n!!! WARNING: $exe not found on board. Skipping $name."
+            lappend results [list $name "off" "MISSING" "" ""]
+            lappend results [list $name "on"  "MISSING" "" ""]
+        }
+    }
+}
+
+board_cmd "cd /root"
+expect -re "$PROMPT"
+board_cmd "/root/sbc_read --migrate=off"
+expect -re "$PROMPT"
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FINAL REPORT
+# ──────────────────────────────────────────────────────────────────────────────
+puts "\n=================================================================="
+puts "===== PARSEC EVALUATION RESULTS"
+puts "=================================================================="
+puts ""
+puts [format "  %-20s %-10s %-14s %-15s" "BENCHMARK" "MIGRATE" "STATUS" "secondary_hits"]
+puts [format "  %-20s %-10s %-14s %-15s" "─────────" "───────" "──────" "──────────────"]
+foreach r $results {
+    puts [format "  %-20s %-10s %-14s %-15s" [lindex $r 0] [lindex $r 1] [lindex $r 2] [lindex $r 3]]
+}
+puts ""
+puts "===== Transcript saved to: $LOGPATH"
+puts "=================================================================="
+
+if {$DO_INTERACT} {
+    puts "\n===== HANDING OVER TO INTERACTIVE SESSION (Ctrl-A Ctrl-X to exit)"
+    interact
+} else {
+    send "\x01\x18"
+    expect eof
+    puts "\n>>> SERIAL PORT FREED <<<"
+}
+exit 0
