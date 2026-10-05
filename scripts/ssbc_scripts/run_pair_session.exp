@@ -67,27 +67,25 @@
 # COUNTER PARSING - anchored on "key=", never on whitespace field position.
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
+# The shared board layer
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Serial, zmodem and staging are identical across the ssbc session scripts and now live in lib/.
+# Each file lists the globals it expects in its own header. Sourced before this script's own
+# configuration so that anything below can override a shared default deliberately.
+set LIB [file join [file dirname [file normalize [info script]]] lib]
+source [file join $LIB config.exp]     ;# DEVICE, BAUD, PROMPT, CY, SCRIPTS, SW_DIR, STAGED, LOGDIR
+source [file join $LIB board.exp]      ;# board_cmd board_run board_probe bail drain dget
+source [file join $LIB transfer.exp]   ;# zmodem_send
+source [file join $LIB staging.exp]    ;# board_matches stage_file stage_one
+source [file join $LIB counters.exp]   ;# num parse_counters
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 # Configuration
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-set CY          "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
-set SCRIPTS     "$CY/scripts/ssbc_scripts"
-set SW_DIR      "$CY/generators/rocket-chip-inclusive-cache/sw"
-set STAGED      "$CY/software/parsec-benchmark/staged"
-set LOGDIR      "$CY/scripts/logs"
-
-set DEVICE    "/dev/ttyUSB2"
-set BAUD      "115200"
-set SEND_CMD  "sz -vv -b -w 1024 -L 128"
-set RECV_CMD  "rz -vv -b -E"
-set LOGIN     "root"
-set PASSWORD  "fpga"
-set PROMPT    "# "
-set BOOT_TMO  1800
 set WORK_TMO  1800
 set BOARD_DIR "/root/parsec"
 set SBC       "/root/sbc_read"
 set PAIR_SH   "/root/parsec/pair.sh"
-set send_slow {1 .008}
 
 set PHASES       {off}      ;# deliberately not {off on} - see MIGRATE DEFAULTS above
 set BIT          ""
@@ -170,252 +168,6 @@ if {$PUSH ni {always verify none cache}} { puts "-push must be always, verify, c
 foreach ph $PHASES { if {$ph ni {off on}} { puts "-phases takes off and/or on"; exit 2 } }
 if {$POLICY ni {plru random}} { puts "-policy must be plru or random"; exit 2 }
 if {$SAMECORE} { set CPU_B $CPU_A }
-
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# Board helpers
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-
-# Send a command and confirm the board echoed it back. Returns 1 on success. Leaves whatever the
-# command printed, and the prompt, still in the buffer for the caller to consume.
-proc board_cmd {cmd {tmo 60}} {
-    global PROMPT
-    set timeout $tmo
-    send -s "$cmd\r"
-    expect {
-        -ex [string range $cmd 0 59] { return 1 }
-        timeout { puts "\n!!! echo mismatch / timeout sending: $cmd"; return 0 }
-    }
-}
-
-# Send a command and wait for the prompt. The common case: output does not matter.
-proc board_run {cmd {tmo 60}} {
-    global PROMPT
-    if {![board_cmd $cmd $tmo]} { return 0 }
-    set timeout $tmo
-    expect {
-        -re "$PROMPT" { return 1 }
-        timeout { puts "\n!!! timeout waiting for the prompt after: $cmd"; return 0 }
-    }
-}
-
-# Send a command and return its exit status, carried back by a unique echoed token. This replaces
-# the send / expect-echo / expect-check_foo=0|1 / expect-prompt block that used to be written out
-# by hand for every test on the board. The token survives the command's own echo because the echo
-# shows the literal "$?", which is not a digit.
-proc board_probe {cmd {tmo 60}} {
-    global PROMPT
-    set tok "P[incr ::probe_seq]"
-    if {![board_cmd "$cmd ; echo ${tok}rc=\$?" $tmo]} { return -1 }
-    set rc -1
-    set timeout $tmo
-    expect {
-        -re "${tok}rc=(\[0-9\]+)" { set rc $expect_out(1,string); exp_continue }
-        -re "$PROMPT"             { }
-        timeout { puts "\n!!! timeout probing: $cmd" }
-    }
-    return $rc
-}
-
-proc bail {msg} {
-    global LOGPATH CSVPATH
-    puts "\n!!! $msg"
-    puts "!!! transcript: $LOGPATH"
-    if {[info exists CSVPATH]} { puts "!!! csv so far  : $CSVPATH" }
-    # Ctrl-A Ctrl-X only exits picocom when picocom is at its normal prompt. If it is sitting at
-    # its own "*** file:" prompt the sequence is typed INTO that prompt, picocom never exits, and
-    # an unbounded "expect eof" hangs forever holding /dev/ttyUSB2 - which is how the 2026-10-02
-    # dual-core run had to be killed by hand. Ask nicely, then stop asking.
-    send "\x01\x18"
-    set timeout 15
-    expect {
-        eof     { }
-        timeout {
-            puts "!!! picocom did not exit on Ctrl-A Ctrl-X - killing it so the port is freed"
-            catch { exec pkill -f "picocom.*ttyUSB" }
-        }
-    }
-    exit 1
-}
-
-# Swallow whatever is still sitting in the buffer, up to a second of silence. A transfer handshake
-# has to be matched against fresh output: if a previous command timed out and left its tail behind,
-# the match fires on stale text and the Ctrl-A Ctrl-S that follows reaches picocom at the wrong
-# moment - picocom then never prompts and the transfer is lost.
-proc drain {} {
-    set timeout 1
-    expect {
-        -re ".+" { exp_continue }
-        timeout  { }
-    }
-}
-
-proc dget {d k {dflt ""}} {
-    if {[dict exists $d $k]} { return [dict get $d $k] }
-    return $dflt
-}
-
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-# File transfer
-# ══════════════════════════════════════════════════════════════════════════════════════════════
-proc zmodem_send {filepath} {
-    global PROMPT
-    set base  [file tail $filepath]
-    set hsize [file size $filepath]
-    incr ::pushed_bytes $hsize
-    drain
-    puts "\n---- transferring $base ($hsize bytes, about [expr {$hsize / 11500}]s) ..."
-
-    if {![board_run "rm -f $base $base.\[0-9\]*"]} { bail "failed to clean old $base" }
-
-    if {![board_cmd "rz -vv -b -E" 30]} { bail "failed to launch rz on the board for $base" }
-    set timeout 30
-    expect {
-        -re "rz waiting|\\*\\*B0|ZMODEM" { }
-        timeout { puts "(waiting for rz ...)" }
-    }
-
-    # One retry before giving up: the key can arrive while picocom is still busy, and a lost
-    # transfer costs the whole session.
-    # picocom 3.1 draws its "*** file:" prompt through linenoise, and linenoise first asks the
-    # terminal where the cursor is - it writes ESC[6n and blocks on the reply. Under expect there
-    # is no terminal emulator to answer, so picocom stops there and the prompt never appears: the
-    # transfer is lost, and Ctrl-A Ctrl-X then lands in the half-open prompt instead of exiting.
-    # TERM=dumb at the spawn should stop linenoise asking at all; this stays as a backstop. Reply
-    # with column 80, never column 1: linenoise asks twice, once before and once after ESC[999C,
-    # and derives the width from the second answer. Answer 1 and it builds a one-column terminal
-    # and crashes in realloc(), taking the session with it.
-    set got_prompt 0
-    foreach attempt {1 2 3} {
-        send "\x01\x13"
-        set timeout 20
-        expect {
-            -ex "\x1b\[6n"           { send "\x1b\[1;80R" ; exp_continue }
-            -re {\*\*\* file:|file:} { set got_prompt 1 }
-            timeout { puts "(no file prompt on attempt $attempt)" }
-        }
-        if {$got_prompt} break
-    }
-    if {!$got_prompt} { bail "picocom never prompted for a file name ($base)" }
-    # CR *and* LF. On TERM=dumb linenoise reads this line with fgets(), which returns only on a
-    # newline, and picocom's tty is raw so a lone CR is never translated into one - the file name
-    # sits in the buffer and the transfer stalls until the timeout. linenoise strips trailing \r
-    # and \n from what it reads, so sending both satisfies the fgets path without corrupting the
-    # path name on the full-editor path, where the CR is what submits.
-    send -s "$filepath\r\n"
-
-    # Fail fast if sz never starts. A transfer that is going to work says so within seconds;
-    # spending the full 900s to discover that nothing ran costs 15 minutes an attempt.
-    set finished 0
-    set timeout 90
-    expect {
-        -re {Sending:|Bytes Sent:}  { }
-        -re "exit status: 0"        { puts "---- $base transferred." ; set finished 1 }
-        -re "exit status: \[1-9\]"  { bail "sz failed immediately for $base" }
-        timeout { bail "sz never started for $base - picocom took the file name but nothing ran" }
-    }
-    if {!$finished} {
-        set timeout 900
-        expect {
-            -re "exit status: 0"       { puts "---- $base transferred." }
-            -re "exit status: \[1-9\]" { bail "sz failed for $base" }
-            timeout                    { bail "transfer timed out for $base" }
-        }
-    }
-    set timeout 60
-    expect -re "$PROMPT"
-
-    # Exact size, not just "non-empty": this came over a 115200-baud serial link.
-    if {[board_probe "test \"\$(wc -c < $base)\" -eq $hsize"] != 0} {
-        bail "$base is the wrong size on the board (expected $hsize bytes) - transfer corrupted"
-    }
-    puts "---- $base verified at $hsize bytes."
-}
-
-# Does the board's copy of a file match the host's, byte for byte? md5 where the board has it,
-# a byte count where it does not.
-#
-# This is the check whose absence cost a whole session. On 2026-10-01 /mnt/sbc_read was present
-# and executable but was not the sbc_read binary: an empty or non-ELF file execs as a silent
-# shell script, so it printed nothing and exited 0. The script accepted it on "test -x" and all
-# 72 runs of the sweep came back rc=0 with no counters and no workload - lu_ncb never ran at all
-# (lu_session_20261001-204742.log). A size check alone would have caught that one, but not the
-# case that worries us more here: a rebuilt binary is very often the same size as the build it
-# replaces, so size says "same file" about a stale one. Hence md5 first.
-proc board_matches {relname hostpath} {
-    global HAVE_MD5
-    if {$HAVE_MD5} {
-        set want [lindex [exec md5sum $hostpath] 0]
-        return [expr {[board_probe "test \"\$(md5sum $relname | cut -d' ' -f1)\" = $want" 300] == 0}]
-    }
-    set want [file size $hostpath]
-    return [expr {[board_probe "test -f $relname && test \"\$(wc -c < $relname)\" -eq $want"] == 0}]
-}
-
-# Staging, in three modes (-push on the command line):
-#
-#   always  the default - every file this session needs comes down from the host, over zmodem,
-#           every session. ~110s for the LU plan, ~12min for the whole PARSEC plan. It is the
-#           only mode in which nothing on the board can be stale, and it is the default because
-#           an hour of dead runs costs more than two minutes of transfers.
-#   verify  keep what is already on the board when its md5 matches the host's, transfer when it
-#           does not. As safe as "always", and as fast as the old cache, but it is a mode you
-#           choose rather than one you get by accident.
-#   none    -skippush: stage nothing. sbc_read is still md5-checked, because that is the one file
-#           whose silent corruption costs a whole sweep, and a mismatch is fatal.
-#
-# The /mnt cache is no longer read in any mode. It is still written, because
-# run_benchmarks_session.exp does trust it - writing a known-good copy repairs the entry that
-# poisoned this one.
-# One flat file from $STAGED into the current board directory, cached under /mnt/parsec.
-proc stage_file {relname {is_exe 1}} {
-    global STAGED
-    stage_one $relname "$STAGED/$relname" "/mnt/parsec/$relname" $is_exe
-}
-
-proc stage_one {relname hostpath cachepath is_exe} {
-    global PUSH BOARD_DIR
-    if {![file exists $hostpath]} { bail "host file missing: $hostpath" }
-
-    if {$PUSH eq "none"} { return }
-    if {$PUSH eq "verify" && [board_matches $relname $hostpath]} {
-        puts "---- $relname already on the board and matches the host"
-        if {$is_exe} { board_run "chmod +x $relname" }
-        return
-    }
-    # -push cache: an FPGA reprogram wipes the initramfs, so every ON window would otherwise pay
-    # ~2.6 MB of zmodem at ~8.5 kB/s - about 28 minutes per boot, which dwarfs the measurement.
-    # /mnt is the SD card and survives a reprogram, and stage_one has always written a copy there.
-    # Reading it back is safe ONLY because the copy is md5-checked against the host first, then
-    # md5-checked again after the local cp. That is the same guarantee -push verify gives, and it
-    # is what the 2026-10-01 disaster lacked: back then a stale /mnt/sbc_read was accepted on a
-    # bare "test -x", printed nothing, exited 0, and cost all 72 runs of a sweep.
-    if {$PUSH eq "cache"} {
-        if {[board_matches $relname $hostpath]} {
-            puts "---- $relname already in $BOARD_DIR and matches the host"
-            if {$is_exe} { board_run "chmod +x $relname" }
-            return
-        }
-        if {[board_matches $cachepath $hostpath]} {
-            puts "---- restoring $relname from the SD cache - no transfer needed"
-            board_run "cp $cachepath $relname" 300
-            if {![board_matches $relname $hostpath]} {
-                bail "$relname copied from $cachepath does not match the host. The SD cache is\
-corrupt; re-run with -push always to force a transfer."
-            }
-            if {$is_exe} { board_run "chmod +x $relname" }
-            return
-        }
-        puts "---- $relname is not in the SD cache (or is stale) - transferring from the host"
-    }
-
-    board_run "rm -f $relname"
-    zmodem_send $hostpath
-    if {$is_exe} { board_run "chmod +x $relname" }
-    # 300s, not the 60s default: this is an SD-card write of a file that can be megabytes, and
-    # on 2026-10-05 the 245 KB netlist's cache write outlived the default timeout. Harmless when it
-    # happens (the next board_cmd resyncs on its own echo) but it costs a minute each time.
-    board_run "mkdir -p [file dirname $cachepath] ; cp $relname $cachepath 2>/dev/null || true" 300
-}
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # The workloads - one trio of procs each
@@ -631,15 +383,6 @@ if {"on" in $PHASES} {
 # ══════════════════════════════════════════════════════════════════════════════════════════════
 # Measurement
 # ══════════════════════════════════════════════════════════════════════════════════════════════
-proc num {v} { return [string is double -strict $v] }
-
-proc parse_counters {line} {
-    set m [dict create]
-    foreach {all k v} [regexp -all -inline {([A-Za-z_][A-Za-z_0-9]*)=([0-9]+)} $line] {
-        dict set m $k $v
-    }
-    return $m
-}
 
 # [PAIR-TIME] carries /proc/uptime stamps, so the values are decimals, and NA where a field does
 # not apply (every b_* field on a solo run). Hence a looser value pattern than parse_counters.
