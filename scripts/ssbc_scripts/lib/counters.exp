@@ -1,0 +1,26 @@
+# counters.exp - parse one [SBC-WINDOW] line into a dict.
+#
+# Shared by the ssbc session scripts. Canonical source: run_pair_session.exp / run_parsec_session.exp
+# as of 2026-10-05.
+#
+# pct and memacc deliberately stay in the individual scripts: run_pair_session and
+# run_parsec_session hold genuinely different versions (parsec's pct also num-checks $new;
+# memacc takes a result dict in pair and a counters dict in parsec). Converging them is a
+# behaviour change, not a move, so it is not part of this extraction.
+#
+# Requires no globals.
+#
+# Provides: num  parse_counters
+
+proc num {v} { return [string is double -strict $v] }
+
+# Pull every key=number pair out of a counter line. Anchored on "key=", never on field position -
+# see COUNTER PARSING in the session headers. "policy=plru" is not a number, so it drops out on
+# its own.
+proc parse_counters {line} {
+    set m [dict create]
+    foreach {all k v} [regexp -all -inline {([A-Za-z_][A-Za-z_0-9]*)=([0-9]+)} $line] {
+        dict set m $k $v
+    }
+    return $m
+}

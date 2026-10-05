@@ -1,0 +1,26 @@
+# config.exp - the board and host paths every ssbc session script shares.
+#
+# Values verified identical across run_parsec_session, run_pair_session, run_board_session,
+# run_benchmarks_session and reboot_and_handover on 2026-10-05 before extraction. LOGDIR was
+# spelled "$SCRIPTS/../logs" in three of them and "$CY/scripts/logs" in two; same directory.
+#
+# Anything a single session owns - BOARD_DIR, SBC, WORK_TMO, PUSH, the workload knobs - stays in
+# that script. This file is only for what all of them agree on.
+
+set CY        "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
+set SCRIPTS   "$CY/scripts/ssbc_scripts"
+set SW_DIR    "$CY/generators/rocket-chip-inclusive-cache/sw"
+set STAGED    "$CY/software/parsec-benchmark/staged"
+set LOGDIR    "$CY/scripts/logs"
+
+set DEVICE    "/dev/ttyUSB2"
+set BAUD      "115200"
+set SEND_CMD  "sz -vv -b -w 1024 -L 128"
+set RECV_CMD  "rz -vv -b -E"
+set LOGIN     "root"
+set PASSWORD  "fpga"
+set PROMPT    "# "
+set BOOT_TMO  1800
+
+# send -s throttles to this. The board's line discipline drops characters on a fast paste.
+set send_slow {1 .008}

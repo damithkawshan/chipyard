@@ -1,0 +1,92 @@
+# board.exp - send a command to the board and know whether it arrived.
+#
+# Shared by the ssbc session scripts. Canonical source: run_pair_session.exp / run_parsec_session.exp
+# as of 2026-10-05; run_board_session.exp, run_benchmarks_session.exp and reboot_and_handover.exp
+# previously carried older forks of board_cmd and bail.
+#
+# Requires these globals in the sourcing script:
+#   PROMPT    the shell prompt to match           (lib/config.exp)
+#   LOGPATH   transcript path, printed by bail    (set by the script, after it opens its log)
+#   CSVPATH   optional; bail mentions it if set
+#
+# Provides: board_cmd  board_run  board_probe  bail  drain  dget
+
+
+# Send a command and confirm the board echoed it back. Returns 1 on success. Leaves whatever the
+# command printed, and the prompt, still in the buffer for the caller to consume.
+proc board_cmd {cmd {tmo 60}} {
+    global PROMPT
+    set timeout $tmo
+    send -s "$cmd\r"
+    expect {
+        -ex [string range $cmd 0 59] { return 1 }
+        timeout { puts "\n!!! echo mismatch / timeout sending: $cmd"; return 0 }
+    }
+}
+
+# Send a command and wait for the prompt. The common case: output does not matter.
+proc board_run {cmd {tmo 60}} {
+    global PROMPT
+    if {![board_cmd $cmd $tmo]} { return 0 }
+    set timeout $tmo
+    expect {
+        -re "$PROMPT" { return 1 }
+        timeout { puts "\n!!! timeout waiting for the prompt after: $cmd"; return 0 }
+    }
+}
+
+# Send a command and return its exit status, carried back by a unique echoed token. This replaces
+# the send / expect-echo / expect-check_foo=0|1 / expect-prompt block that used to be written out
+# by hand for every test on the board. The token survives the command's own echo because the echo
+# shows the literal "$?", which is not a digit.
+proc board_probe {cmd {tmo 60}} {
+    global PROMPT
+    set tok "P[incr ::probe_seq]"
+    if {![board_cmd "$cmd ; echo ${tok}rc=\$?" $tmo]} { return -1 }
+    set rc -1
+    set timeout $tmo
+    expect {
+        -re "${tok}rc=(\[0-9\]+)" { set rc $expect_out(1,string); exp_continue }
+        -re "$PROMPT"             { }
+        timeout { puts "\n!!! timeout probing: $cmd" }
+    }
+    return $rc
+}
+
+proc bail {msg} {
+    global LOGPATH CSVPATH
+    puts "\n!!! $msg"
+    puts "!!! transcript: $LOGPATH"
+    if {[info exists CSVPATH]} { puts "!!! csv so far  : $CSVPATH" }
+    # Ctrl-A Ctrl-X only exits picocom when picocom is at its normal prompt. If it is sitting at
+    # its own "*** file:" prompt the sequence is typed INTO that prompt, picocom never exits, and
+    # an unbounded "expect eof" hangs forever holding /dev/ttyUSB2 - which is how the 2026-10-02
+    # dual-core run had to be killed by hand. Ask nicely, then stop asking.
+    send "\x01\x18"
+    set timeout 15
+    expect {
+        eof     { }
+        timeout {
+            puts "!!! picocom did not exit on Ctrl-A Ctrl-X - killing it so the port is freed"
+            catch { exec pkill -f "picocom.*ttyUSB" }
+        }
+    }
+    exit 1
+}
+
+# Swallow whatever is still sitting in the buffer, up to a second of silence. A transfer handshake
+# has to be matched against fresh output: if a previous command timed out and left its tail behind,
+# the match fires on stale text and the Ctrl-A Ctrl-S that follows reaches picocom at the wrong
+# moment - picocom then never prompts and the transfer is lost.
+proc drain {} {
+    set timeout 1
+    expect {
+        -re ".+" { exp_continue }
+        timeout  { }
+    }
+}
+
+proc dget {d k {dflt ""}} {
+    if {[dict exists $d $k]} { return [dict get $d $k] }
+    return $dflt
+}

@@ -1,0 +1,86 @@
+# transfer.exp - push one host file to the board over zmodem, and prove it arrived intact.
+#
+# Shared by the ssbc session scripts. Canonical source: run_pair_session.exp / run_parsec_session.exp
+# as of 2026-10-05. The picocom/linenoise handling and the 90s fail-fast below exist because of
+# named, dated failures - read the comments before changing any timeout here.
+#
+# Requires these globals in the sourcing script:
+#   PROMPT         the shell prompt to match      (lib/config.exp)
+#   pushed_bytes   running total, incremented here; initialise it to 0
+# Requires from lib/board.exp: board_cmd, board_run, drain, bail
+#
+# Provides: zmodem_send
+
+proc zmodem_send {filepath} {
+    global PROMPT
+    set base  [file tail $filepath]
+    set hsize [file size $filepath]
+    incr ::pushed_bytes $hsize
+    drain
+    puts "\n---- transferring $base ($hsize bytes, about [expr {$hsize / 11500}]s) ..."
+
+    if {![board_run "rm -f $base $base.\[0-9\]*"]} { bail "failed to clean old $base" }
+
+    if {![board_cmd "rz -vv -b -E" 30]} { bail "failed to launch rz on the board for $base" }
+    set timeout 30
+    expect {
+        -re "rz waiting|\\*\\*B0|ZMODEM" { }
+        timeout { puts "(waiting for rz ...)" }
+    }
+
+    # One retry before giving up: the key can arrive while picocom is still busy, and a lost
+    # transfer costs the whole session.
+    # picocom 3.1 draws its "*** file:" prompt through linenoise, and linenoise first asks the
+    # terminal where the cursor is - it writes ESC[6n and blocks on the reply. Under expect there
+    # is no terminal emulator to answer, so picocom stops there and the prompt never appears: the
+    # transfer is lost, and Ctrl-A Ctrl-X then lands in the half-open prompt instead of exiting.
+    # TERM=dumb at the spawn should stop linenoise asking at all; this stays as a backstop. Reply
+    # with column 80, never column 1: linenoise asks twice, once before and once after ESC[999C,
+    # and derives the width from the second answer. Answer 1 and it builds a one-column terminal
+    # and crashes in realloc(), taking the session with it.
+    set got_prompt 0
+    foreach attempt {1 2 3} {
+        send "\x01\x13"
+        set timeout 20
+        expect {
+            -ex "\x1b\[6n"           { send "\x1b\[1;80R" ; exp_continue }
+            -re {\*\*\* file:|file:} { set got_prompt 1 }
+            timeout { puts "(no file prompt on attempt $attempt)" }
+        }
+        if {$got_prompt} break
+    }
+    if {!$got_prompt} { bail "picocom never prompted for a file name ($base)" }
+    # CR *and* LF. On TERM=dumb linenoise reads this line with fgets(), which returns only on a
+    # newline, and picocom's tty is raw so a lone CR is never translated into one - the file name
+    # sits in the buffer and the transfer stalls until the timeout. linenoise strips trailing \r
+    # and \n from what it reads, so sending both satisfies the fgets path without corrupting the
+    # path name on the full-editor path, where the CR is what submits.
+    send -s "$filepath\r\n"
+
+    # Fail fast if sz never starts. A transfer that is going to work says so within seconds;
+    # spending the full 900s to discover that nothing ran costs 15 minutes an attempt.
+    set finished 0
+    set timeout 90
+    expect {
+        -re {Sending:|Bytes Sent:}  { }
+        -re "exit status: 0"        { puts "---- $base transferred." ; set finished 1 }
+        -re "exit status: \[1-9\]"  { bail "sz failed immediately for $base" }
+        timeout { bail "sz never started for $base - picocom took the file name but nothing ran" }
+    }
+    if {!$finished} {
+        set timeout 900
+        expect {
+            -re "exit status: 0"       { puts "---- $base transferred." }
+            -re "exit status: \[1-9\]" { bail "sz failed for $base" }
+            timeout                    { bail "transfer timed out for $base" }
+        }
+    }
+    set timeout 60
+    expect -re "$PROMPT"
+
+    # Exact size, not just "non-empty": this came over a 115200-baud serial link.
+    if {[board_probe "test \"\$(wc -c < $base)\" -eq $hsize"] != 0} {
+        bail "$base is the wrong size on the board (expected $hsize bytes) - transfer corrupted"
+    }
+    puts "---- $base verified at $hsize bytes."
+}
