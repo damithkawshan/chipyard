@@ -1,0 +1,24 @@
+#!/usr/bin/expect -f
+# Read-only check: is lu/lu_cb/lu_ncb already present on the board?
+set timeout 60
+set DEVICE "/dev/ttyUSB2"
+set BAUDRATE "115200"
+set PROMPT "# "
+
+spawn picocom -b $BAUDRATE $DEVICE
+expect {
+    "Terminal ready" { }
+    timeout { puts "Timeout waiting for picocom"; exit 1 }
+}
+
+send "\r"
+expect {
+    -re "$PROMPT" { }
+    timeout { send "\r"; expect -re "$PROMPT" }
+}
+
+send "ls -la /root/parsec/lu* /mnt/parsec/lu* 2>&1\r"
+expect -re "$PROMPT"
+
+send "\x01\x18"
+expect eof

@@ -45,6 +45,9 @@ SBC_64L2_PLRU_DUAL=FPGADualRocketVCU118L18K64K16WL2ConfigSBCPLRU
 NOSBC_128L2=FPGASingleRocketVCU118L18K128K16WL2ConfigNoSbc
 SBC_128L2=FPGASingleRocketVCU118L18K128K16WL2ConfigSBC
 
+SINGLE_1M_8W=FPGASingleRocketVCU118L18K1024K8WL2ConfigSBCPLRU
+DUAL_1M_8W=FPGADualRocketVCU118L18K1024K8WL2ConfigSBCPLRU
+
 # --- other configs previously built (kept as a record; pass any of these as an argument) -----
 # SingleRocketVCU118L18K256K16WL2ConfigTLCounter
 # QuadRocketVCU118ConfigSatTLCounter256KL2Config
@@ -101,7 +104,10 @@ case "${1:-both}" in
   sbc_128l2)   build_one "$SBC_128L2"   || rc=1 ;;
   both_128l2)  build_one "$NOSBC_128L2" || rc=1
                build_one "$SBC_128L2"   || rc=1 ;;
-  *)          build_one "$1"     || rc=1 ;;  # explicit config name
+  single_1m_8w) build_one "$SINGLE_1M_8W" || rc=1 ;;
+  dual_1m_8w)   build_one "$DUAL_1M_8W"   || rc=1 ;;
+  FPGA*)       build_one "$1"          || rc=1 ;;  # explicit config with FPGA prefix
+  *)           build_one "FPGA$1"      || rc=1 ;;  # auto-prepend FPGA prefix if omitted
 esac
 
 echo "=============================================================="

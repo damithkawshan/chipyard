@@ -1,0 +1,297 @@
+#!/usr/bin/expect --
+#
+# reboot_and_handover.exp - Reprogram the FPGA bitstream, boot Linux, mount SD card,
+# copy SBC tools and wrappers to the board, and release the serial port for connect_serial.sh.
+#
+# Usage:
+#   ./reboot_and_handover.exp
+#   ./reboot_and_handover.exp -bit /path/to/bitfile.bit
+#   ./reboot_and_handover.exp -noprog
+#   ./reboot_and_handover.exp -interact    # stay in picocom instead of releasing port
+#
+
+set CY          "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
+set SCRIPTS     "$CY/scripts/ssbc_scripts"
+set SW_DIR      "$CY/generators/rocket-chip-inclusive-cache/sw"
+set DEFAULT_BIT "$CY/fpga/generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness.FPGASingleRocketVCU118L18K64K16WL2ConfigSBCPLRU/obj/VCU118FPGATestHarness.bit"
+
+set BIT         $DEFAULT_BIT
+set DO_PROG     1
+set DO_INTERACT 0
+set POLICY      ""
+set BOOT_TMO    1800
+set SETUP_TMO   3600
+
+set DEVICE      "/dev/ttyUSB2"
+set BAUD        "115200"
+set SEND_CMD    "sz -vv -b -w 1024 -L 128"
+set RECV_CMD    "rz -vv -b -E"
+set LOGIN       "root"
+set PASSWORD    "fpga"
+set PROMPT      "# "
+
+set send_slow   {1 .008}
+
+# Parse command line args
+for {set i 0} {$i < $argc} {incr i} {
+    set a [lindex $argv $i]
+    switch -- $a {
+        "-bit"      { incr i; set BIT [lindex $argv $i] }
+        "-noprog"   { set DO_PROG 0 }
+        "-interact" { set DO_INTERACT 1 }
+        "-boottmo"  { incr i; set BOOT_TMO [lindex $argv $i] }
+        "-policy"   { incr i; set POLICY [lindex $argv $i] }
+        default     { puts "unknown arg: $a"; exit 2 }
+    }
+}
+
+# Candidate files to push to the board
+set CANDIDATES [list \
+    "$SW_DIR/build/sbc_read" \
+    "$SW_DIR/run_sbc_window.sh" \
+    "$SW_DIR/build/l2_miss_calib" \
+    "$SCRIPTS/cyc" \
+    "$SW_DIR/build/pe" \
+    "$SW_DIR/build/csrprobe" \
+]
+
+set PUSH_FILES [list]
+foreach f $CANDIDATES {
+    if {[file exists $f]} {
+        lappend PUSH_FILES $f
+    } else {
+        puts "note: optional binary $f not found, skipping"
+    }
+}
+
+if {[llength $PUSH_FILES] == 0} {
+    puts "ERROR: No files found to push to board!"
+    exit 1
+}
+
+# Ensure log dir exists
+set LOGDIR "$SCRIPTS/../logs"
+catch { file mkdir $LOGDIR }
+if {![file isdirectory $LOGDIR] || ![file writable $LOGDIR]} {
+    set LOGDIR "$env(HOME)/sbc-logs"
+    catch { file mkdir $LOGDIR }
+}
+set stamp [clock format [clock seconds] -format "%Y%m%d-%H%M%S"]
+set LOGPATH "$LOGDIR/handover_$stamp.log"
+log_file -a $LOGPATH
+
+puts "\n=================================================================="
+puts "===== REBOOT AND HANDOVER CONFIGURATION"
+puts "=================================================================="
+puts "===== bitstream     : $BIT"
+puts "===== program FPGA  : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog)}}]"
+puts "===== device / baud : $DEVICE @ $BAUD"
+puts "===== push files    :"
+foreach pf $PUSH_FILES {
+    puts "=====   [file tail $pf] ([file size $pf] bytes)"
+}
+puts "===== policy        : [expr {$POLICY eq {} ? {as found} : $POLICY}]"
+puts "===== handover mode : [expr {$DO_INTERACT ? {interactive in current terminal} : {exit picocom -> user connects via connect_serial.sh}}]"
+puts "===== log           : $LOGPATH"
+puts "==================================================================\n"
+
+# Helper: send command and verify echo
+proc board_cmd {cmd {tmo 60}} {
+    global PROMPT
+    set timeout $tmo
+    send -s "$cmd\r"
+    set probe [string range $cmd 0 59]
+    expect {
+        -ex $probe { return 1 }
+        timeout {
+            puts "\n!!! echo mismatch / timeout sending: $cmd"
+            return 0
+        }
+    }
+}
+
+# ----------------------------------------------------------------------------- 1. Program FPGA
+if {$DO_PROG} {
+    if {![file exists $BIT]} {
+        puts "ERROR: Missing bitstream: $BIT"
+        exit 1
+    }
+    puts "===== \[1/5\] Killing any serial processes before FPGA programming ..."
+    catch { exec pkill -f "picocom.*ttyUSB" }
+    catch { exec pkill -f "screen.*ttyUSB" }
+    sleep 1
+
+    puts "===== \[1/5\] Programming FPGA with Vivado (may take a few minutes) ..."
+    set timeout 900
+    spawn bash "$SCRIPTS/programFPGA.sh" $BIT
+    expect {
+        "FPGA programming complete!"  { puts "\n===== FPGA programmed successfully." }
+        "ERROR"                       { puts "\n!!! Vivado error programming FPGA"; exit 1 }
+        timeout                       { puts "\n!!! Vivado programming timed out"; exit 1 }
+        eof                           { puts "\n!!! programFPGA.sh exited"; }
+    }
+    catch { expect eof }
+} else {
+    puts "===== \[1/5\] Skipping FPGA programming (-noprog)"
+}
+
+# ----------------------------------------------------------------------------- 2. Open serial
+puts "===== \[2/5\] Opening serial console ($DEVICE) ..."
+set timeout 60
+if {![file exists $DEVICE]} {
+    puts "\n!!! $DEVICE not found. Waiting up to 10s for device to appear..."
+    for {set retries 0} {$retries < 10} {incr retries} {
+        sleep 1
+        if {[file exists $DEVICE]} { break }
+    }
+    if {![file exists $DEVICE]} {
+        puts "\n!!! $DEVICE still not present. Check FPGA connection."
+        exit 1
+    }
+}
+
+catch { exec pkill -f "picocom.*ttyUSB" }
+sleep 1
+
+spawn picocom -b $BAUD --send-cmd $SEND_CMD --receive-cmd $RECV_CMD $DEVICE
+expect {
+    "Terminal ready" { puts "\n===== picocom ready." }
+    -re "cannot open|Device or resource busy|No such file" {
+        puts "\n!!! picocom could not open $DEVICE"; exit 1
+    }
+    timeout { puts "\n!!! picocom never became ready"; exit 1 }
+}
+
+# ----------------------------------------------------------------------------- 3. Wait for Linux & login
+puts "===== \[3/5\] Waiting for Linux to boot ..."
+set timeout $BOOT_TMO
+send "\r"
+expect {
+    -re "Welcome to Buildroot" {
+        puts "\n===== Buildroot banner detected."
+        exp_continue
+    }
+    -re "login:"        { send -s "$LOGIN\r"; exp_continue }
+    -re "Password:"     { send -s "$PASSWORD\r"; exp_continue }
+    -re "\n$PROMPT"     { puts "\n===== Shell prompt ready." }
+    -re "^$PROMPT"      { puts "\n===== Shell prompt ready." }
+    -re {\[ *[0-9]+\.[0-9]+\]}          { exp_continue }
+    -re "INIT|CMD|LOADING|BOOT"          { exp_continue }
+    -re "Linux version|Starting"         { exp_continue }
+    -re "Kernel panic|Oops:|Unable to mount" {
+        puts "\n!!! Kernel panic / boot failure"; exit 1
+    }
+    timeout {
+        puts "\n!!! Timeout (${BOOT_TMO}s) waiting for Linux boot."
+        exit 1
+    }
+}
+
+# ----------------------------------------------------------------------------- 4. Mount and transfer files
+puts "===== \[4/5\] Setting up filesystem and transferring files ..."
+
+# Mount SD card and make test directories
+board_cmd "grep -q ' /mnt ' /proc/mounts || mount /dev/mmcblk0p2 /mnt"
+expect -re "$PROMPT"
+board_cmd "mkdir -p test_dir"
+expect -re "$PROMPT"
+board_cmd "test -x test_dir/memtest || (test -f /mnt/damith_vcu118/memtest && cp /mnt/damith_vcu118/memtest test_dir/ && chmod +x test_dir/memtest)"
+expect -re "$PROMPT"
+
+# Transfer files via ZMODEM
+foreach f $PUSH_FILES {
+    set base [file tail $f]
+    set hsize [file size $f]
+    puts "\n----- Sending $base ($hsize bytes) ..."
+    
+    set timeout 60
+    board_cmd "rm -f $base $base.\[0-9\]*"
+    expect -re "$PROMPT"
+    
+    set timeout 30
+    if {![board_cmd "rz -vv -b -E" 30]} {
+        puts "\n!!! rz failed to start for $base"; exit 1
+    }
+    expect {
+        -re "rz waiting|\\*\\*B0|ZMODEM" { }
+        timeout { puts "\n(note: proceeding to send file)" }
+    }
+    
+    send "\x01\x13"
+    expect {
+        -re "file:" { send -s "$f\r" }
+        timeout     { puts "\n!!! picocom file prompt timed out"; exit 1 }
+    }
+    
+    set timeout 900
+    expect {
+        -re "exit status: 0"       { puts "\n===== $base transferred successfully." }
+        -re "exit status: \[1-9\]" { puts "\n!!! sz transfer failed for $base"; exit 1 }
+        timeout                    { puts "\n!!! Transfer timed out for $base"; exit 1 }
+    }
+    
+    set timeout 60
+    expect -re "$PROMPT"
+    board_cmd "chmod +x $base"
+    expect -re "$PROMPT"
+    
+    # Verify file size on board
+    board_cmd "wc -c < $base"
+    expect {
+        -re "(\[0-9\]+)\s" {
+            set bsize $expect_out(1,string)
+            if {$bsize == $hsize} {
+                puts "      Size verified: $bsize bytes"
+            } else {
+                puts "      WARNING: size mismatch (host $hsize vs board $bsize)"
+            }
+        }
+        timeout { puts "      (could not read back size)" }
+    }
+    expect -re "$PROMPT"
+}
+
+# ----------------------------------------------------------------------------- 5. Verify & Status
+puts "\n===== \[5/5\] Querying initial SBC status via sbc_read ..."
+set timeout 60
+board_cmd "./sbc_read"
+expect {
+    -re "ACCESSES" { }
+    timeout { puts "(sbc_read query timed out)" }
+}
+expect -re "$PROMPT"
+
+if {$POLICY ne ""} {
+    puts "===== Setting policy=$POLICY ..."
+    board_cmd "./sbc_read --policy=$POLICY"
+    expect -re "$PROMPT"
+}
+
+# ----------------------------------------------------------------------------- Handover
+if {$DO_INTERACT} {
+    puts "\n=================================================================="
+    puts "===== HANDING OVER TO INTERACTIVE SESSION (Ctrl-A Ctrl-X to exit)"
+    puts "=================================================================="
+    interact
+} else {
+    puts "\n=================================================================="
+    puts "===== SETUP COMPLETE - HANDING OVER TO YOU"
+    puts "=================================================================="
+    puts "FPGA programmed with: $BIT"
+    puts "Linux booted and root shell ready."
+    puts "Installed in /root:"
+    foreach pf $PUSH_FILES {
+        puts "  - [file tail $pf]"
+    }
+    puts "Mounted SD card at /mnt, test_dir ready."
+    puts ""
+    puts "Releasing $DEVICE so you can connect via connect_serial.sh..."
+    send "\x01\x18"
+    expect eof
+    puts ""
+    puts ">>> SERIAL PORT FREED <<<"
+    puts "You can now run:"
+    puts "    cd $SCRIPTS && ./connect_serial.sh"
+    puts "==================================================================\n"
+}
+exit 0

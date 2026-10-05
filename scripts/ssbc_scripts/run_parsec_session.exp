@@ -1,534 +1,1222 @@
 #!/usr/bin/expect --
 #
-# run_parsec_session.exp - Full pipeline for PARSEC benchmark evaluation on VCU118.
+# run_parsec_session.exp - program the VCU118, boot it, stage the workloads, and measure the SBC
+#                          migrate=off vs migrate=on A/B over a plan of runs.
 #
-# Replaces the previous version of this script, which never programmed the FPGA or booted/mounted
-# anything (it assumed a live session was already up) and detected a workload's completion from the
-# [SBC-WINDOW] line alone, with no exp_continue to the "workload rc=" echo that follows it. That is a
-# race: a single-shot `expect` can return on a stale or partial buffer match before the child process
-# actually exited, truncating the measured window. The 2026-09-30 PARSEC report (accessA down 33-45%
-# between the OFF and ON phases of the SAME binary and input) is the symptom - a same-work violation,
-# not an SBC effect. Fixed here by following run_benchmarks_session.exp's pattern: exp_continue through
-# BOTH the [SBC-WINDOW] line and the "workload rc=" echo, then wait for the prompt, and refuse to report
-# a window if either marker was never seen. Arguments for canneal and bodytrack are taken from PARSEC's
-# own pkgs/*/parsec/simdev.runconf, not re-guessed.
-#
-# Steps:
-#   1. Program FPGA bitstream via Vivado
-#   2. Boot Linux on VCU118, wait for shell
-#   3. Mount SD card, copy sbc_read and other tools
-#   4. Transfer PARSEC benchmark binaries + inputs via zmodem (idempotent: board -> /mnt cache -> zmodem)
-#   5. Run each benchmark with migration OFF (baseline) then migration ON (SBC active), same binary
-#      and input both times
-#   6. Collect all L2/memory performance counters and report
+# Two plans:
+#   -plan parsec   (default)  the nine PARSEC / SPLASH-2 apps, one run each
+#   -plan lu                  the LU star sweep described under "LU SWEEP" below
+#   -plan cal                 canneal loader-vs-annealing calibration (migrate=off only)
+#   -plan sccal               streamcluster memory-intensity calibration (migrate=off only)
 #
 # Usage:
-#   ./run_parsec_session.exp -bit /path/to/bitfile.bit
-#   ./run_parsec_session.exp -noprog              # skip FPGA programming (already loaded)
-#   ./run_parsec_session.exp -skippush            # skip file transfers (already on board)
-#   ./run_parsec_session.exp -interact            # stay in picocom after completion
-#   ./run_parsec_session.exp -tmo 1800            # workload timeout in seconds
-#   ./run_parsec_session.exp -threads 1           # pthread count passed to each benchmark
-#   ./run_parsec_session.exp -bench blackscholes,swaptions   # subset (default: all five)
-#   ./run_parsec_session.exp -policy plru         # L2_Replacement resets to random on every
-#                                                  # reprogram; set explicitly or that is what runs
+#   ./run_parsec_session.exp                        # PARSEC plan, programs the default bitstream
+#   ./run_parsec_session.exp -plan lu               # LU sweep around the known-good centre point
+#   ./run_parsec_session.exp -plan lu -repeat 3     # three runs per point per phase
+#   ./run_parsec_session.exp -noprog                # the board already has the bitstream
+#   ./run_parsec_session.exp -push verify            # keep board files whose md5 matches the host
+#   ./run_parsec_session.exp -skippush               # stage nothing (sbc_read is still md5-checked)
+#   ./run_parsec_session.exp -bench canneal,lu_n256 # subset, by the labels the plan prints
+#   ./run_parsec_session.exp -plan lu -lu-b 64,128,256 -lu-n 512 -lu-p 2
+#   ./run_parsec_session.exp -policy random         # centre policy (see POLICY below)
+#   ./run_parsec_session.exp -interact              # stay in picocom at the end
+#
+# Output: the transcript, plus one CSV row per run. Both paths are printed at the end. Plot with
+#   python3 scripts/ssbc_scripts/plot_sbc_sweep.py <csv>
+#
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Things this script knows that are easy to get wrong
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#
+# PHASE ORDER - every migrate=off run happens before any migrate=on run, for the whole plan.
+#   Two reasons: the OFF half is the baseline, so collecting it first means a session that dies
+#   halfway still leaves a complete baseline behind; and sbc_read --reset-all refuses to run while
+#   lines are parked (the address table is their only home-set record), so the OFF->ON boundary is
+#   the one moment in a session when a clean reset is legal.
+#   The cost of this order is that the two halves of a pair are separated in time - which is what
+#   the same-work check below is for.
+#
+# COMPLETION - a run is believed only once BOTH the [SBC-WINDOW] line AND the "workload rc=" echo
+#   have been seen (exp_continue through each, then wait for the prompt). A single-shot expect can
+#   return on a stale or partial buffer match before the child has exited, which truncates the
+#   measured window; the 2026-09-30 PARSEC report, where accessA fell 33-45% between the OFF and ON
+#   phases of the same binary on the same input, is what that looks like. If either marker is
+#   missing the run is recorded as incomplete and no window is reported for it.
+#
+# STAGING - every file the run needs is transferred from the host every session by default
+#   (-push always). Not because the link is fast - it is 115200 baud, ~110s for the LU plan and
+#   ~12min for the whole PARSEC plan - but because the alternative failed silently: on 2026-10-01
+#   a stale /mnt/sbc_read was copied in on a "test -x" check, printed nothing, exited 0, and all
+#   72 runs of a sweep reported no window while lu_ncb never executed. -push verify keeps what is
+#   already on the board when its md5 matches the host's, which is the fast and still-safe mode.
+#
+# COUNTER PARSING - values are pulled out of the raw "key=value" text, never from whitespace-split
+#   field positions: Verilog's %d pads to the signal's bit width, which silently mis-fielded these
+#   lines before (2026-09-30). Anchoring on "key=" is immune to that.
+#
+# POLICY - L2_Replacement resets to 0 (random) on every FPGA reprogram, even on a bitstream built
+#   with plruReplacement=true. It does not follow from the bitstream. So it is set explicitly on
+#   every measured run, and it is part of each run's label, because it is one of the knobs the LU
+#   sweep varies.
+#
+# SAME WORK - accessA is the same-work check. If the OFF and ON halves of a point did not do
+#   comparable work then the traffic and cycle deltas are not an SBC effect, they are a measurement
+#   artefact. The report flags any pair whose accessA differs by more than 2%.
+#
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# LU SWEEP  (-plan lu)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# The centre point is the run that first showed a clear SBC effect on LU - history.log lines 59-61,
+# 2026-10-01, on this same 256KB 8-way bitstream:
+#
+#     ./sbc_read --zero --policy=plru [--migrate=on] && ./lu_ncb -p2 -n512 -b128 && ./sbc_read
+#
+# The sweep walks outward from that point one knob at a time, so any change in the counters is
+# attributable to the single knob that moved. Defaults:
+#
+#   n   256 384 512 768 1024   matrix footprint n*n*8B = 512KB .. 8MB, all of it above the 256KB L2
+#   b   16 32 64 128 256       per-block working set b*b*8B = 2KB .. 512KB, crossing L2 capacity
+#                              between b=128 (128KB) and b=256 (512KB) - the interesting crossing
+#   p   1 2 4                  this is a SINGLE-core bitstream, so p>1 is threads timesharing one
+#                              core: it changes the access interleaving, not the parallelism
+#   policy  plru random        the victim policy the SBC competes with
+#
+# lu_ncb (non-contiguous blocks) is the centre point's binary, so it is what the sweep uses; the
+# -plan parsec lu_n* points stay on lu_cb, which is what they have always measured.
+#
+# No -t: LU's own factorization self-check failed on all eight runs of the 2026-10-01 lu_cb sweep
+# (the same diff OFF and ON, so not an SBC effect, but still unexplained), and the centre-point
+# command above does not use it either. Pass -lucheck to put it back.
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 # Configuration
-# ──────────────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 set CY          "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
 set SCRIPTS     "$CY/scripts/ssbc_scripts"
 set SW_DIR      "$CY/generators/rocket-chip-inclusive-cache/sw"
 set STAGED      "$CY/software/parsec-benchmark/staged"
+set LOGDIR      "$CY/scripts/logs"
 set DEFAULT_BIT "$CY/fpga/bitstream_storage/FPGASingleRocketVCU118L18K256K8WL2ConfigSBCPLRU-256KB-8way-candidate013-2026-10-01-2026-10-01.bit"
 
-set DEVICE      "/dev/ttyUSB2"
-set BAUD        "115200"
-set SEND_CMD    "sz -vv -b -w 1024 -L 128"
-set RECV_CMD    "rz -vv -b -E"
-set LOGIN       "root"
-set PASSWORD    "fpga"
-set PROMPT      "# "
-set BOOT_TMO    1800
-set WORK_TMO    1800
+set DEVICE    "/dev/ttyUSB2"
+set BAUD      "115200"
+set SEND_CMD  "sz -vv -b -w 1024 -L 128"
+set RECV_CMD  "rz -vv -b -E"
+set LOGIN     "root"
+set PASSWORD  "fpga"
+set PROMPT    "# "
+set BOOT_TMO  1800
+set WORK_TMO  1800
+set BOARD_DIR "/root/parsec"
+set SBC       "/root/sbc_read"
+set send_slow {1 .008}
 
-set send_slow   {1 .008}
-
-# Defaults
+# Defaults; every one of these is overridable on the command line
+set PLAN         "parsec"
+set PHASES       {off on}   ;# -phases: which sides of the switch to run, in order
 set BIT          $DEFAULT_BIT
 set DO_PROG      1
-set SKIP_PUSH    0
+set PUSH         "always"   ;# always | verify | none - see the staging block
+set HAVE_MD5     0
+set pushed_bytes 0
 set DO_INTERACT  0
+set DO_LIST      0   ;# -list: print the plan and exit WITHOUT touching the board
+set FORCE_PORT   0
+set DO_RESETALL  0
 set NTHREADS     2
 set BENCH_FILTER ""
-set POLICY       ""
+set POLICY       "plru"
+set REPEAT       1
+set LU_CHECK     0
 
-# Every entry: {name exe {extra files} run_cmd}. Args are PARSEC's own simdev.runconf values
-# (pkgs/*/parsec/simdev.runconf), except canneal's netlist name, which is adapted to what is staged
-# (canneal_6k.nets, not PARSEC's own 100.nets - same simdev swap/temp/pass magnitudes).
-set ALL_APPS [list \
-    {blackscholes   blackscholes   {in_16.txt}            "./blackscholes \$NTHREADS in_16.txt prices.txt"} \
-    {swaptions      swaptions      {}                     "./swaptions -ns 3 -sm 50 -nt \$NTHREADS"} \
-    {streamcluster  streamcluster  {}                     "./streamcluster 3 10 3 16 16 10 none output.txt \$NTHREADS"} \
-    {canneal        canneal        {canneal_6k.nets}      "./canneal \$NTHREADS 100 300 canneal_6k.nets 2"} \
-    {bodytrack      bodytrack      {sequenceB_1.tar.gz}   "./bodytrack sequenceB_1 4 1 100 3 0 \$NTHREADS"} \
-]
+# streamcluster calibration plan (-plan sccal). dim:chunksize, ascending in footprint.
+# chunksize*dim*4 B of coordinates: 512 KB, 2 MB, 8 MB, 8 MB at dim 128, 2 MB at dim 16.
+set SC_POINTS {64:2048 64:8192 64:32768 128:16384 16:32768}
+set SC_K1      2
+set SC_K2      3
+set SC_CLUSTER 100
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Parse command line
-# ──────────────────────────────────────────────────────────────────────────────
+# Calibration plan (-plan cal)
+set CAL_NETS  {canneal_6k.nets canneal_30k.nets}
+set CAL_SWAPS {0 2000 20000 200000}
+set CAL_STEPS 1
+
+# LU sweep: the centre point, and the axes that pass through it
+set LU_CP   2
+set LU_CN   512
+set LU_CB   128
+set LU_N    {256 384 512 768 1024}
+set LU_B    {16 32 64 128 256}
+set LU_P    {1 2 4}
+set LU_POL  {plru random}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Command line
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 for {set i 0} {$i < $argc} {incr i} {
     set a [lindex $argv $i]
     switch -- $a {
+        "-plan"      { incr i; set PLAN [lindex $argv $i] }
+        "-phases"    { incr i; set PHASES [split [lindex $argv $i] ","] }
         "-bit"       { incr i; set BIT [lindex $argv $i] }
         "-noprog"    { set DO_PROG 0 }
-        "-skippush"  { set SKIP_PUSH 1 }
+        "-skippush"  { set PUSH "none" }
+        "-push"      { incr i; set PUSH [lindex $argv $i] }
         "-interact"  { set DO_INTERACT 1 }
+        "-list"      { set DO_LIST 1 }
+        "-force-port" { set FORCE_PORT 1 }
+        "-resetall"  { set DO_RESETALL 1 }
         "-tmo"       { incr i; set WORK_TMO [lindex $argv $i] }
         "-threads"   { incr i; set NTHREADS [lindex $argv $i] }
         "-bench"     { incr i; set BENCH_FILTER [lindex $argv $i] }
         "-policy"    { incr i; set POLICY [lindex $argv $i] }
+        "-repeat"    { incr i; set REPEAT [lindex $argv $i] }
+        "-lucheck"   { set LU_CHECK 1 }
+        "-lu-n"      { incr i; set LU_N [split [lindex $argv $i] ","] }
+        "-lu-b"      { incr i; set LU_B [split [lindex $argv $i] ","] }
+        "-lu-p"      { incr i; set LU_P [split [lindex $argv $i] ","] }
+        "-lu-policy" { incr i; set LU_POL [split [lindex $argv $i] ","] }
+        "-lu-centre" { incr i; lassign [split [lindex $argv $i] ","] LU_CP LU_CN LU_CB }
+        "-cal-nets"  { incr i; set CAL_NETS [split [lindex $argv $i] ","] }
+        "-cal-swaps" { incr i; set CAL_SWAPS [split [lindex $argv $i] ","] }
+        "-cal-steps" { incr i; set CAL_STEPS [lindex $argv $i] }
+        "-sc-points" { incr i; set SC_POINTS [split [lindex $argv $i] ","] }
+        "-sc-k"      { incr i; lassign [split [lindex $argv $i] ","] SC_K1 SC_K2 }
+        "-sc-cluster" { incr i; set SC_CLUSTER [lindex $argv $i] }
         default      { puts "unknown arg: $a"; exit 2 }
     }
 }
+if {$PLAN ni {parsec lu cal sccal}} { puts "-plan must be parsec, lu, cal or sccal"; exit 2 }
+if {$PUSH ni {always verify none cache}} { puts "-push must be always, verify, cache or none"; exit 2 }
+foreach ph $PHASES { if {$ph ni {off on}} { puts "-phases takes off and/or on"; exit 2 } }
+if {$POLICY ni {plru random}} { puts "-policy must be plru or random"; exit 2 }
 
-set APPS [list]
-if {$BENCH_FILTER eq ""} {
-    set APPS $ALL_APPS
-} else {
-    foreach want [split $BENCH_FILTER ","] {
-        foreach app $ALL_APPS {
-            if {[lindex $app 0] eq $want} { lappend APPS $app }
-        }
-    }
-}
-if {[llength $APPS] == 0} {
-    puts "ERROR: no benchmarks selected (check -bench against: blackscholes swaptions streamcluster canneal bodytrack)"
-    exit 2
-}
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Board helpers
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Log setup
-# ──────────────────────────────────────────────────────────────────────────────
-set stamp [clock format [clock seconds] -format "%Y%m%d-%H%M%S"]
-set LOGDIR "$SCRIPTS/../logs"
-catch { file mkdir $LOGDIR }
-set LOGPATH "$LOGDIR/parsec_session_$stamp.log"
-log_file -a $LOGPATH
-
-set bench_names [list]
-foreach app $APPS { lappend bench_names [lindex $app 0] }
-
-puts "\n=================================================================="
-puts "===== PARSEC VCU118 EVALUATION"
-puts "=================================================================="
-puts "===== bitstream      : $BIT"
-puts "===== program FPGA   : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog)}}]"
-puts "===== skip push      : [expr {$SKIP_PUSH ? {yes} : {no}}]"
-puts "===== benchmarks     : [join $bench_names {, }] (threads: $NTHREADS)"
-puts "===== workload timeout: ${WORK_TMO}s"
-puts "===== log            : $LOGPATH"
-puts "==================================================================\n"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────────────────────────────────────
+# Send a command and confirm the board echoed it back. Returns 1 on success. Leaves whatever the
+# command printed, and the prompt, still in the buffer for the caller to consume.
 proc board_cmd {cmd {tmo 60}} {
     global PROMPT
     set timeout $tmo
     send -s "$cmd\r"
-    set probe [string range $cmd 0 59]
     expect {
-        -ex $probe { return 1 }
-        timeout {
-            puts "\n!!! echo mismatch / timeout sending: $cmd"
-            return 0
-        }
+        -ex [string range $cmd 0 59] { return 1 }
+        timeout { puts "\n!!! echo mismatch / timeout sending: $cmd"; return 0 }
     }
+}
+
+# Send a command and wait for the prompt. The common case: output does not matter.
+proc board_run {cmd {tmo 60}} {
+    global PROMPT
+    if {![board_cmd $cmd $tmo]} { return 0 }
+    set timeout $tmo
+    expect {
+        -re "$PROMPT" { return 1 }
+        timeout { puts "\n!!! timeout waiting for the prompt after: $cmd"; return 0 }
+    }
+}
+
+# Send a command and return its exit status, carried back by a unique echoed token. This replaces
+# the send / expect-echo / expect-check_foo=0|1 / expect-prompt block that used to be written out
+# by hand for every test on the board. The token survives the command's own echo because the echo
+# shows the literal "$?", which is not a digit.
+proc board_probe {cmd {tmo 60}} {
+    global PROMPT
+    set tok "P[incr ::probe_seq]"
+    if {![board_cmd "$cmd ; echo ${tok}rc=\$?" $tmo]} { return -1 }
+    set rc -1
+    set timeout $tmo
+    expect {
+        -re "${tok}rc=(\[0-9\]+)" { set rc $expect_out(1,string); exp_continue }
+        -re "$PROMPT"             { }
+        timeout { puts "\n!!! timeout probing: $cmd" }
+    }
+    return $rc
 }
 
 proc bail {msg} {
-    global LOGPATH
+    global LOGPATH CSVPATH
     puts "\n!!! $msg"
     puts "!!! transcript: $LOGPATH"
+    if {[info exists CSVPATH]} { puts "!!! csv so far  : $CSVPATH" }
+    # Ctrl-A Ctrl-X only exits picocom when picocom is at its normal prompt. If it is sitting at
+    # its own "*** file:" prompt the sequence is typed INTO that prompt, picocom never exits, and
+    # an unbounded "expect eof" hangs forever holding /dev/ttyUSB2 - which is how the 2026-10-02
+    # dual-core run had to be killed by hand. Ask nicely, then stop asking.
     send "\x01\x18"
-    expect eof
+    set timeout 15
+    expect {
+        eof     { }
+        timeout {
+            puts "!!! picocom did not exit on Ctrl-A Ctrl-X - killing it so the port is freed"
+            catch { exec pkill -f "picocom.*ttyUSB" }
+        }
+    }
     exit 1
 }
 
+# Swallow whatever is still sitting in the buffer, up to a second of silence. A transfer handshake
+# has to be matched against fresh output: if a previous command timed out and left its tail behind,
+# the match fires on stale text and the Ctrl-A Ctrl-S that follows reaches picocom at the wrong
+# moment - picocom then never prompts and the transfer is lost.
+proc drain {} {
+    set timeout 1
+    expect {
+        -re ".+" { exp_continue }
+        timeout  { }
+    }
+}
+
+proc dget {d k {dflt ""}} {
+    if {[dict exists $d $k]} { return [dict get $d $k] }
+    return $dflt
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# File transfer
+# ══════════════════════════════════════════════════════════════════════════════════════════════
 proc zmodem_send {filepath} {
     global PROMPT
-    set base [file tail $filepath]
+    set base  [file tail $filepath]
     set hsize [file size $filepath]
-    puts "\n----- transferring $base ($hsize bytes) ..."
+    incr ::pushed_bytes $hsize
+    drain
+    puts "\n---- transferring $base ($hsize bytes, about [expr {$hsize / 11500}]s) ..."
 
-    set timeout 60
-    if {![board_cmd "rm -f $base $base.\[0-9\]*"]} { bail "failed to clean old $base" }
-    expect -re "$PROMPT"
+    if {![board_run "rm -f $base $base.\[0-9\]*"]} { bail "failed to clean old $base" }
 
+    if {![board_cmd "rz -vv -b -E" 30]} { bail "failed to launch rz on the board for $base" }
     set timeout 30
-    if {![board_cmd "rz -vv -b -E" 30]} { bail "failed to launch rz on board for $base" }
     expect {
         -re "rz waiting|\\*\\*B0|ZMODEM" { }
-        timeout { puts "(waiting for rz...)" }
+        timeout { puts "(waiting for rz ...)" }
     }
 
-    send "\x01\x13"
+    # One retry before giving up: the key can arrive while picocom is still busy, and a lost
+    # transfer costs the whole session.
+    # picocom 3.1 draws its "*** file:" prompt through linenoise, and linenoise first asks the
+    # terminal where the cursor is - it writes ESC[6n and blocks on the reply. Under expect there
+    # is no terminal emulator to answer, so picocom stops there and the prompt never appears: the
+    # transfer is lost, and Ctrl-A Ctrl-X then lands in the half-open prompt instead of exiting.
+    # TERM=dumb at the spawn should stop linenoise asking at all; this stays as a backstop. Reply
+    # with column 80, never column 1: linenoise asks twice, once before and once after ESC[999C,
+    # and derives the width from the second answer. Answer 1 and it builds a one-column terminal
+    # and crashes in realloc(), taking the session with it.
+    set got_prompt 0
+    foreach attempt {1 2 3} {
+        send "\x01\x13"
+        set timeout 20
+        expect {
+            -ex "\x1b\[6n"           { send "\x1b\[1;80R" ; exp_continue }
+            -re {\*\*\* file:|file:} { set got_prompt 1 }
+            timeout { puts "(no file prompt on attempt $attempt)" }
+        }
+        if {$got_prompt} break
+    }
+    if {!$got_prompt} { bail "picocom never prompted for a file name ($base)" }
+    # CR *and* LF. On TERM=dumb linenoise reads this line with fgets(), which returns only on a
+    # newline, and picocom's tty is raw so a lone CR is never translated into one - the file name
+    # sits in the buffer and the transfer stalls until the timeout. linenoise strips trailing \r
+    # and \n from what it reads, so sending both satisfies the fgets path without corrupting the
+    # path name on the full-editor path, where the CR is what submits.
+    send -s "$filepath\r\n"
+
+    # Fail fast if sz never starts. A transfer that is going to work says so within seconds;
+    # spending the full 900s to discover that nothing ran costs 15 minutes an attempt.
+    set finished 0
+    set timeout 90
     expect {
-        -re "file:" { send -s "$filepath\r" }
-        timeout     { bail "picocom never prompted for file name ($base)" }
+        -re {Sending:|Bytes Sent:}  { }
+        -re "exit status: 0"        { puts "---- $base transferred." ; set finished 1 }
+        -re "exit status: \[1-9\]"  { bail "sz failed immediately for $base" }
+        timeout { bail "sz never started for $base - picocom took the file name but nothing ran" }
     }
-
-    set timeout 900
-    expect {
-        -re "exit status: 0"       { puts "\n===== $base transferred successfully." }
-        -re "exit status: \[1-9\]" { bail "sz failed for $base" }
-        timeout                    { bail "transfer timed out for $base" }
+    if {!$finished} {
+        set timeout 900
+        expect {
+            -re "exit status: 0"       { puts "---- $base transferred." }
+            -re "exit status: \[1-9\]" { bail "sz failed for $base" }
+            timeout                    { bail "transfer timed out for $base" }
+        }
     }
-
     set timeout 60
     expect -re "$PROMPT"
-    if {![board_cmd "chmod +x $base"]} { bail "failed chmod $base" }
-    expect -re "$PROMPT"
 
-    if {![board_cmd "wc -c < $base"]} { bail "failed wc -c $base" }
-    expect {
-        -re "(\[0-9\]+)" {
-            set bsize $expect_out(1,string)
-            if {$bsize == $hsize} {
-                puts "      verified size: $bsize bytes matches host"
-            } else {
-                puts "      (read size $bsize, expected $hsize)"
+    # Exact size, not just "non-empty": this came over a 115200-baud serial link.
+    if {[board_probe "test \"\$(wc -c < $base)\" -eq $hsize"] != 0} {
+        bail "$base is the wrong size on the board (expected $hsize bytes) - transfer corrupted"
+    }
+    puts "---- $base verified at $hsize bytes."
+}
+
+# Does the board's copy of a file match the host's, byte for byte? md5 where the board has it,
+# a byte count where it does not.
+#
+# This is the check whose absence cost a whole session. On 2026-10-01 /mnt/sbc_read was present
+# and executable but was not the sbc_read binary: an empty or non-ELF file execs as a silent
+# shell script, so it printed nothing and exited 0. The script accepted it on "test -x" and all
+# 72 runs of the sweep came back rc=0 with no counters and no workload - lu_ncb never ran at all
+# (lu_session_20261001-204742.log). A size check alone would have caught that one, but not the
+# case that worries us more here: a rebuilt binary is very often the same size as the build it
+# replaces, so size says "same file" about a stale one. Hence md5 first.
+proc board_matches {relname hostpath} {
+    global HAVE_MD5
+    if {$HAVE_MD5} {
+        set want [lindex [exec md5sum $hostpath] 0]
+        return [expr {[board_probe "test \"\$(md5sum $relname | cut -d' ' -f1)\" = $want" 300] == 0}]
+    }
+    set want [file size $hostpath]
+    return [expr {[board_probe "test -f $relname && test \"\$(wc -c < $relname)\" -eq $want"] == 0}]
+}
+
+# Staging, in three modes (-push on the command line):
+#
+#   always  the default - every file this session needs comes down from the host, over zmodem,
+#           every session. ~110s for the LU plan, ~12min for the whole PARSEC plan. It is the
+#           only mode in which nothing on the board can be stale, and it is the default because
+#           an hour of dead runs costs more than two minutes of transfers.
+#   verify  keep what is already on the board when its md5 matches the host's, transfer when it
+#           does not. As safe as "always", and as fast as the old cache, but it is a mode you
+#           choose rather than one you get by accident.
+#   none    -skippush: stage nothing. sbc_read is still md5-checked, because that is the one file
+#           whose silent corruption costs a whole sweep, and a mismatch is fatal.
+#
+# The /mnt cache is no longer read in any mode. It is still written, because
+# run_benchmarks_session.exp does trust it - writing a known-good copy repairs the entry that
+# poisoned this one.
+# One flat file from $STAGED into the current board directory, cached under /mnt/parsec.
+proc stage_file {relname {is_exe 1}} {
+    global STAGED
+    stage_one $relname "$STAGED/$relname" "/mnt/parsec/$relname" $is_exe
+}
+
+proc stage_one {relname hostpath cachepath is_exe} {
+    global PUSH BOARD_DIR
+    if {![file exists $hostpath]} { bail "host file missing: $hostpath" }
+
+    if {$PUSH eq "none"} { return }
+    if {$PUSH eq "verify" && [board_matches $relname $hostpath]} {
+        puts "---- $relname already on the board and matches the host"
+        if {$is_exe} { board_run "chmod +x $relname" }
+        return
+    }
+    # -push cache: an FPGA reprogram wipes the initramfs, so every ON window would otherwise pay
+    # ~2.6 MB of zmodem at ~8.5 kB/s - about 28 minutes per boot, which dwarfs the measurement.
+    # /mnt is the SD card and survives a reprogram, and stage_one has always written a copy there.
+    # Reading it back is safe ONLY because the copy is md5-checked against the host first, then
+    # md5-checked again after the local cp. That is the same guarantee -push verify gives, and it
+    # is what the 2026-10-01 disaster lacked: back then a stale /mnt/sbc_read was accepted on a
+    # bare "test -x", printed nothing, exited 0, and cost all 72 runs of a sweep.
+    if {$PUSH eq "cache"} {
+        if {[board_matches $relname $hostpath]} {
+            puts "---- $relname already in $BOARD_DIR and matches the host"
+            if {$is_exe} { board_run "chmod +x $relname" }
+            return
+        }
+        if {[board_matches $cachepath $hostpath]} {
+            puts "---- restoring $relname from the SD cache - no transfer needed"
+            board_run "cp $cachepath $relname" 300
+            if {![board_matches $relname $hostpath]} {
+                bail "$relname copied from $cachepath does not match the host. The SD cache is\
+corrupt; re-run with -push always to force a transfer."
             }
+            if {$is_exe} { board_run "chmod +x $relname" }
+            return
         }
-        timeout { puts "      (warning: could not verify size)" }
+        puts "---- $relname is not in the SD cache (or is stale) - transferring from the host"
     }
-    expect -re "$PROMPT"
+
+    board_run "rm -f $relname"
+    zmodem_send $hostpath
+    if {$is_exe} { board_run "chmod +x $relname" }
+    # 300s, not the 60s default: this is an SD-card write of a file that can be megabytes, and
+    # on 2026-10-05 the 245 KB netlist's cache write outlived the default timeout. Harmless when it
+    # happens (the next board_cmd resyncs on its own echo) but it costs a minute each time.
+    board_run "mkdir -p [file dirname $cachepath] ; cp $relname $cachepath 2>/dev/null || true" 300
 }
 
-# Idempotent: present locally -> present on /mnt/parsec cache -> zmodem from $STAGED. Covers one
-# plain file (an executable or a data file) sitting flat in /root/parsec.
-proc stage_file {relname hostpath {is_exe 1}} {
-    global PROMPT STAGED
-    board_cmd "test -e $relname ; echo check_${relname}=\$?"
-    expect {
-        -re "check_${relname}=0" { expect -re "$PROMPT"; return }
-        -re "check_${relname}=1" { expect -re "$PROMPT" }
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# The benchmarks - one pair of procs each
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+#   bench_<id>_stage        put everything that benchmark needs into $BOARD_DIR
+#   bench_<id>_cmd ...      return the command line to measure, relative to $BOARD_DIR
+#
+# Adding a benchmark means adding these two procs and one line in a plan proc below. Nothing else
+# in the script needs to know the benchmark exists.
+#
+# The arguments are PARSEC's own simdev.runconf values (pkgs/*/parsec/simdev.runconf), not guesses.
+# The one deliberate change is canneal's netlist: the staged canneal_6k.nets instead of PARSEC's own
+# 100.nets, at the same simdev swap / temperature / pass magnitudes.
+
+proc bench_blackscholes_stage {} { stage_file blackscholes ; stage_file in_16.txt 0 }
+proc bench_blackscholes_cmd   {} { return "./blackscholes $::NTHREADS in_16.txt prices.txt" }
+
+proc bench_swaptions_stage {} { stage_file swaptions }
+proc bench_swaptions_cmd   {} { return "./swaptions -ns 3 -sm 50 -nt $::NTHREADS" }
+
+proc bench_streamcluster_stage {} { stage_file streamcluster }
+
+# streamcluster k1 k2 dim n chunksize clustersize infile outfile nproc
+#
+# No input file is needed: the data is generated whenever n > 0 (streamcluster.cpp:1989,
+# "infile: Input file (if n<=0)"), so unlike canneal there is no loader phase to dilute the window.
+#
+# The two things that matter here are separable, which is why this is the partner workload:
+#   FOOTPRINT is chunksize*dim*4 B of coordinates (the `block` malloc) plus chunksize*32 B of
+#     Point structs.
+#   COMPUTE is iter = ITER*kmax*log(kmax) calls to pgain per pFL round, and pgain is O(n*dim).
+#     ITER is 3. So kmax scales the work per byte touched.
+# A small kmax with a large chunksize*dim therefore gives a memory-bound stream: pgain walks the
+# whole coordinate array once per call and almost nothing is reused. That is what a co-runner
+# needs. canneal taught us the hard way that a large footprint is NOT the same as a high miss
+# rate - its annealing phase still hit 85.8% because its hot working set is small.
+proc bench_streamcluster_cmd {{k1 3} {k2 10} {dim 3} {n 16} {chunk 16} {cluster 10}} {
+    return "./streamcluster $k1 $k2 $dim $n $chunk $cluster none output.txt $::NTHREADS"
+}
+
+# Which netlists the planned points actually ask for. canneal_30k.nets is 1.37 MB and costs ~2min
+# over zmodem, so it is staged only when a point names it - plan_parsec still pays for 6k alone.
+# Filled in by bench_canneal_cmd at plan-build time, which runs before staging.
+set CANNEAL_NETS {}
+
+proc bench_canneal_stage {} {
+    stage_file canneal
+    foreach nets $::CANNEAL_NETS { stage_file $nets 0 }
+}
+
+# NSWAPS is per temperature step and is divided among the threads (annealer_thread.h:
+#   _moves_per_thread_temp = swaps_per_temp/nthreads
+# ) so the total annealing work is NSWAPS*NSTEPS whatever NTHREADS is - canneal is fixed-work.
+# NSWAPS=0 runs the netlist loader and zero moves, which is how -plan cal separates the loader
+# cost from the annealing cost. The defaults here are PARSEC simdev's, so plan_parsec is unchanged.
+proc bench_canneal_cmd {{nets "canneal_6k.nets"} {nswaps 100} {temp 300} {nsteps 2}} {
+    if {[lsearch -exact $::CANNEAL_NETS $nets] < 0} { lappend ::CANNEAL_NETS $nets }
+    return "./canneal $::NTHREADS $nswaps $temp $nets $nsteps"
+}
+
+proc bench_bodytrack_stage {} {
+    global PUSH
+    stage_file bodytrack
+    if {$PUSH eq "always"} { board_run "rm -rf sequenceB_1" }
+    # The CALIB file, not just the directory: a half-extracted sequenceB_1 is what segfaulted six
+    # runs on 2026-10-01, and "the directory exists" does not rule that out.
+    if {[board_probe "test -f sequenceB_1/CALIB/Camera1.cal"] == 0} { return }
+    stage_file sequenceB_1.tar.gz 0
+    # NOT "tar -xzf": the BusyBox tar on this image is built without gzip support and answers
+    # "tar: invalid option -- 'z'". That failed silently on 2026-10-01 and six bodytrack runs then
+    # segfaulted on the missing CALIB file - hence the explicit check below rather than trust.
+    board_run "gunzip -c sequenceB_1.tar.gz | tar xf -"
+    if {[board_probe "test -f sequenceB_1/CALIB/Camera1.cal"] != 0} {
+        bail "sequenceB_1 did not extract - bodytrack would segfault on the missing CALIB file"
     }
-    board_cmd "test -e /mnt/parsec/$relname && cp /mnt/parsec/$relname . || true"
-    expect -re "$PROMPT"
-    board_cmd "test -e $relname ; echo checkmnt_${relname}=\$?"
-    expect {
-        -re "checkmnt_${relname}=0" {
-            puts "\n===== $relname restored from /mnt/parsec/"
-            expect -re "$PROMPT"
-        }
-        -re "checkmnt_${relname}=1" {
-            expect -re "$PROMPT"
-            zmodem_send "$hostpath"
+    puts "---- sequenceB_1 extracted (CALIB present)."
+}
+proc bench_bodytrack_cmd {} { return "./bodytrack sequenceB_1 4 1 100 3 0 $::NTHREADS" }
+
+# SPLASH-2 LU. -n matrix size, -b block size, -p worker threads. Both variants take the same flags;
+# lu_cb allocates each block contiguously, lu_ncb does not, which is why they stress the L2
+# differently at the same -n and -b.
+proc bench_lu_cb_stage {} { stage_file lu_cb }
+proc bench_lu_cb_cmd {p n b} { return [lu_cmdline ./lu_cb $p $n $b] }
+
+proc bench_lu_ncb_stage {} { stage_file lu_ncb }
+proc bench_lu_ncb_cmd {p n b} { return [lu_cmdline ./lu_ncb $p $n $b] }
+
+proc lu_cmdline {exe p n b} {
+    set cmd "$exe -p$p -n$n -b$b"
+    if {$::LU_CHECK} { append cmd " -t" }     ;# see the header: this check fails on this board
+    return $cmd
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Plans
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# A plan is a list of points. A point is a dict:
+#   label   identity of the point - pairs the OFF run with the ON run, and is what -bench matches
+#   bench   which bench_<id>_stage / _cmd procs it belongs to
+#   cmd     the command line to measure
+#   axis    which knob this point varies, for the report only
+#   policy  the victim policy to set for this point
+#   p n b   the LU knobs, empty for everything else
+
+proc point {label bench cmd {axis "app"} {policy ""} {p ""} {n ""} {b ""}} {
+    if {$policy eq ""} { set policy $::POLICY }
+    return [dict create label $label bench $bench cmd $cmd axis $axis policy $policy \
+                        p $p n $n b $b]
+}
+
+proc plan_parsec {} {
+    set plan [list]
+    foreach id {blackscholes swaptions streamcluster canneal bodytrack} {
+        lappend plan [point $id $id [bench_${id}_cmd]]
+    }
+    # The lu_cb points this plan has always carried: matrix sizes that straddle the 256KB L2
+    # (128KB, 288KB, 512KB, 1.125MB of matrix) at the fixed -p1 -b16 the earlier sweep measured.
+    foreach n {128 192 256 384} {
+        lappend plan [point "lu_n$n" lu_cb [bench_lu_cb_cmd 1 $n 16] app "" 1 $n 16]
+    }
+    return $plan
+}
+
+# Calibration (-plan cal): decide how much of a canneal window is the netlist loader and how much
+# is annealing, so a canneal setting can be chosen that actually anneals for as long as LU runs.
+# NSWAPS=0 is the loader on its own; the rest give the slope, so
+#   annealing accesses(NSWAPS) = accessA(NSWAPS) - accessA(0)
+# One LU point first, for the runtime we are matching canneal to. Run this with -phases off: it
+# exists to pick a setting, not to measure SBC, and it must not park anything.
+proc plan_cal {} {
+    set plan [list]
+    lappend plan [point "lu-ref" lu_ncb [bench_lu_ncb_cmd $::LU_CP $::LU_CN $::LU_CB] \
+                        cal "" $::LU_CP $::LU_CN $::LU_CB]
+    # Netlists outermost and swaps ascending, so the cheap points are measured before the slow
+    # ones and a -tmo that kills the largest still leaves the slope behind.
+    foreach nets $::CAL_NETS {
+        set tag [string map {canneal_ "" .nets ""} $nets]
+        foreach sw $::CAL_SWAPS {
+            lappend plan [point "cann-$tag-s$sw" canneal \
+                                [bench_canneal_cmd $nets $sw 300 $::CAL_STEPS] cal]
         }
     }
-    if {$is_exe} {
-        board_cmd "chmod +x $relname"
-        expect -re "$PROMPT"
+    return $plan
+}
+
+# Calibration (-plan sccal): find a streamcluster setting whose memory intensity matches LU's.
+# The quantity to match is memAcc/accessA - main-memory accesses per L2 access - NOT the footprint.
+# Measured 2026-10-05: LU n=512 b=128 is 0.949, while canneal's annealing phase is only 0.155 at a
+# 1.6 MB footprint. Footprint alone does not make a co-runner; missing does.
+# Run with -phases off. Points ascend in cost so a -tmo that kills the largest still leaves the
+# scaling behind.
+proc plan_sccal {} {
+    set plan [list]
+    lappend plan [point "lu-ref" lu_ncb [bench_lu_ncb_cmd $::LU_CP $::LU_CN $::LU_CB] \
+                        cal "" $::LU_CP $::LU_CN $::LU_CB]
+    # The PARSEC simdev point, as a sanity check: it is the one streamcluster setting already
+    # known to complete on this board (rc=0 on 2026-10-01).
+    lappend plan [point "sc-dev" streamcluster [bench_streamcluster_cmd] cal]
+    # dim:chunksize[:n]. n defaults to chunksize, i.e. a single chunk. Giving n > chunksize makes
+    # streamCluster loop over n/chunksize chunks through the SAME block buffer
+    # (streamcluster.cpp:1888 while(1)), so the footprint stays at chunksize*dim*4 B while the
+    # runtime scales with the chunk count. That is the only way to get a competitor that FITS in
+    # the L2 and still runs as long as LU - which is what the b=32 experiment needs.
+    #
+    # Watch centersize: copycenters appends up to kmax centers per chunk and the program exits 1
+    # with "oops! no more space for centers" once they exceed it. At kmax=3 that is ~2.5 per chunk.
+    foreach spec $::SC_POINTS {
+        lassign [split $spec ":"] d c n
+        if {$n eq ""} { set n $c }
+        lappend plan [point "sc-d$d-c$c-n$n" streamcluster \
+                            [bench_streamcluster_cmd $::SC_K1 $::SC_K2 $d $n $c $::SC_CLUSTER] cal]
+    }
+    return $plan
+}
+
+# The star sweep: the centre point, then one point per step along each axis through it. Every point
+# differs from the centre in exactly one knob.
+proc plan_lu {} {
+    set plan [list]
+    set seen [list]
+    lu_add plan seen centre $::LU_CP $::LU_CN $::LU_CB $::POLICY
+    foreach n   $::LU_N   { lu_add plan seen n      $::LU_CP $n       $::LU_CB $::POLICY }
+    foreach b   $::LU_B   { lu_add plan seen b      $::LU_CP $::LU_CN $b       $::POLICY }
+    foreach p   $::LU_P   { lu_add plan seen p      $p       $::LU_CN $::LU_CB $::POLICY }
+    foreach pol $::LU_POL { lu_add plan seen policy $::LU_CP $::LU_CN $::LU_CB $pol }
+    return $plan
+}
+
+proc lu_add {planvar seenvar axis p n b policy} {
+    upvar 1 $planvar plan $seenvar seen
+    set label "lu-p$p-n$n-b$b-$policy"
+    if {[lsearch -exact $seen $label] >= 0} { return }   ;# the centre sits on every axis
+    lappend seen $label
+    lappend plan [point $label lu_ncb [bench_lu_ncb_cmd $p $n $b] $axis $policy $p $n $b]
+}
+
+proc plan_for {which} {
+    switch -- $which {
+        lu      { return [plan_lu] }
+        cal     { return [plan_cal] }
+        sccal   { return [plan_sccal] }
+        default { return [plan_parsec] }
     }
 }
 
-# Accumulate results for final report
+set PLANNED [plan_for $PLAN]
+
+if {$BENCH_FILTER ne ""} {
+    set wanted [split $BENCH_FILTER ","]
+    set kept [list]
+    foreach pt $PLANNED {
+        if {[lsearch -exact $wanted [dict get $pt label]] >= 0} { lappend kept $pt }
+    }
+    set PLANNED $kept
+}
+if {[llength $PLANNED] == 0} {
+    puts "ERROR: the plan is empty. -plan $PLAN offers these labels:"
+    foreach pt [plan_for $PLAN] { puts "  [dict get $pt label]" }
+    exit 2
+}
+
+# -list exists so that inspecting a plan never needs the serial port. Everything above this point
+# is pure computation; everything below it talks to the board.
+if {$DO_LIST} {
+    puts "plan for -plan $PLAN  ([llength $PLANNED] point(s)):"
+    foreach pt $PLANNED { puts "  [dict get $pt label]   ->   [dict get $pt cmd]" }
+    exit 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Is another measurement session already using the board?
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 2 below pkills every picocom on a ttyUSB. That is how this script takes the port from a
+# stale one or from an interactive connect_serial.sh, both of which are safe to kill. Doing it to
+# a LIVE campaign is not: on 2026-10-05 a second invocation killed a running calibration's picocom
+# in the middle of a zmodem transfer (sz caught signal 15 at 413 KB of 1315 KB) and lost the
+# session.
+#
+# Rivals are found by argv[0] being the expect interpreter, NOT by comm: the kernel truncates comm
+# to 15 characters and reports it as the script's own name ("run_parsec_sess"), so a comm test for
+# "expect" matches nothing and the guard silently never fires. Testing argv[0] also excludes the
+# shell wrapper that a tmux launch puts around this script, which carries the script name too.
+set rivals [list]
+catch {
+    foreach line [split [exec ps -eo pid=,args=] "\n"] {
+        set line [string trim $line]
+        if {![regexp {^(\d+)\s+(.*)$} $line -> rpid rargs]} { continue }
+        if {$rpid == [pid]} { continue }
+        if {![regexp {^\S*expect(\s|$)} $rargs]} { continue }
+        if {[regexp {run_(parsec|pair)_session\.exp} $rargs]} { lappend rivals "$rpid  $rargs" }
+    }
+}
+if {[llength $rivals] > 0 && !$FORCE_PORT} {
+    puts "\n!!! another measurement session already owns the board:"
+    foreach r $rivals { puts "!!!   $r" }
+    puts "!!! Starting now would kill its picocom mid-session and lose it. Wait for it to finish,"
+    puts "!!! or pass -force-port if you are certain it is dead."
+    exit 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Transcript and CSV
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+set stamp [clock format [clock seconds] -format "%Y%m%d-%H%M%S"]
+catch { file mkdir $LOGDIR }
+set LOGPATH "$LOGDIR/${PLAN}_session_$stamp.log"
+set CSVPATH "$LOGDIR/${PLAN}_runs_$stamp.csv"
+log_file -a $LOGPATH
+
+# A window without these is not a measurement. Checked on every run, because the failure mode is
+# silent: expect returns on the first chunk of input that satisfies the pattern, so a pattern that
+# can match a prefix of the line WILL eventually match a prefix of the line. On 2026-10-02 that
+# turned 72 complete windows into 72 rows holding 0-5 of 24 counters, all stamped OK, and the
+# report then averaged over blanks and announced that the same-work check had passed
+# (lu_session_20261002-010911.log; the transcript still had every full line, so
+# recover_csv_from_log.py rebuilt the run from it). The pattern now requires the line's newline,
+# which a prefix cannot supply; this check is the belt to that braces.
+set NEEDED {accessA memReads memWrites L2_Cycles migrations secHits}
+
+# Every counter sbc_read prints that is worth keeping. One CSV column each, in this order.
+set CSV_COLS {migrations secHits secMiss attempted aborted parked dispDrop dispRelease \
+              accessA primaryHit secondaryHit probedHit dataMiss upgradeMiss \
+              secondSearch secondaryMiss memReads memWrites L2_Accesses L2_Hits L2_Cycles \
+              dstAbortDirty dstAbortHeld dstAbortBoth}
+
+set csv_fh [open $CSVPATH w]
+puts $csv_fh [join [concat {label axis bench policy p n b migrate rep status rc} $CSV_COLS] ","]
+flush $csv_fh
+
+# One entry per run attempted; each is the point's dict plus migrate/rep/status/rc/counters.
 set results [list]
 
-proc run_benchmark_phase {name cmd mig_state} {
-    global PROMPT WORK_TMO results
-    puts "\n=================================================================="
-    puts "===== RUNNING $name  \[migrate=$mig_state\]"
-    puts "=================================================================="
+proc banner {args} {
+    puts "\n══════════════════════════════════════════════════════════════════════════════════════"
+    foreach line $args { puts "═════ $line" }
+    puts "══════════════════════════════════════════════════════════════════════════════════════"
+}
 
-    set full_cmd "/root/sbc_read --migrate=$mig_state --zero -- sh -c '$cmd 2> wl.err' ; echo \"workload rc=\$?\" ; tail -5 wl.err"
-    puts "----- command: $full_cmd"
+set labels [list]
+foreach pt $PLANNED { lappend labels [dict get $pt label] }
+banner "SBC MIGRATION A/B - plan '$PLAN', [llength $PLANNED] point(s) x $REPEAT run(s) x 2 phases" \
+       "bitstream : $BIT" \
+       "program   : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog)}}]" \
+       "staging   : $PUSH  (always = every file comes from the host this session)" \
+       "policy    : $POLICY  (set on every run - it does not survive a reprogram)" \
+       "threads   : $NTHREADS (PARSEC apps; LU takes its own -p)" \
+       "timeout   : ${WORK_TMO}s per run" \
+       "phases    : [join $PHASES { then }]" \
+       "points    : [join $labels { }]" \
+       "transcript: $LOGPATH" \
+       "csv       : $CSVPATH"
 
-    if {![board_cmd "$full_cmd"]} {
-        lappend results [list $name $mig_state "SEND_FAIL" "" ""]
-        return 0
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Measurement
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+
+# Pull every key=number pair out of a counter line. Anchored on "key=", never on field position -
+# see COUNTER PARSING in the header. "policy=plru" is not a number, so it drops out on its own.
+proc parse_counters {line} {
+    set m [dict create]
+    foreach {all k v} [regexp -all -inline {([A-Za-z_][A-Za-z_0-9]*)=([0-9]+)} $line] {
+        dict set m $k $v
     }
+    return $m
+}
+
+proc record {pt mig rep status rc counters} {
+    global results CSV_COLS csv_fh
+    lappend results [dict merge $pt [dict create migrate $mig rep $rep status $status rc $rc \
+                                                 counters $counters]]
+    set row [list [dict get $pt label] [dict get $pt axis] [dict get $pt bench] \
+                  [dict get $pt policy] [dict get $pt p] [dict get $pt n] [dict get $pt b] \
+                  $mig $rep $status $rc]
+    foreach c $CSV_COLS { lappend row [dget $counters $c] }
+    puts $csv_fh [join $row ","]
+    flush $csv_fh                      ;# a killed session still leaves every finished run behind
+}
+
+# One measured run. Returns 1 if a window was recorded.
+proc measure {pt mig rep} {
+    global PROMPT WORK_TMO SBC REPEAT NEEDED
+    set label  [dict get $pt label]
+    set policy [dict get $pt policy]
+
+    puts "\n──────────────────────────────────────────────────────────────────────────────────────"
+    puts "──── $label   migrate=$mig  policy=$policy  run $rep/$REPEAT"
+
+    # One sbc_read call does all of it, in the order the hardware needs: set the switch, set the
+    # policy, zero the counters, then fork / exec / waitpid around the workload and print the
+    # window. Same window the centre-point command measured by hand with three shell commands.
+    set full "$SBC --migrate=$mig --policy=$policy --zero -- sh -c '[dict get $pt cmd] 2> wl.err'"
+    append full " ; echo \"workload rc=\$?\" ; tail -5 wl.err"
+    puts "──── $full"
+
+    if {![board_cmd $full]} { record $pt $mig $rep "SEND_FAIL" "?" {} ; return 0 }
 
     set timeout $WORK_TMO
-    set sbc_line ""
-    set sec_hits "?"
-    set workload_rc "?"
+    set window ""
+    set rc     "?"
     set saw_rc 0
-    # Both the [SBC-WINDOW] line AND the "workload rc=" echo must be seen (exp_continue on each) before
-    # falling through to the prompt wait below. [SBC-WINDOW] alone is not proof the child exited - see
-    # the file header. sbc_read's own waitpid() guarantees the print follows exit, so the real risk was
-    # the SINGLE-SHOT match returning on a stale/partial buffer read, not sbc_read's ordering.
+    # Both markers, each via exp_continue, before falling through to the prompt. See COMPLETION.
     expect {
-        -re {\[SBC-WINDOW\][^\r\n]*} {
-            set sbc_line $expect_out(0,string)
-            puts "\n===== \[SBC-WINDOW\]: $sbc_line"
-            if {[regexp {secHits=(\d+)} $sbc_line -> sh]} { set sec_hits $sh }
+        -re {\[SBC-WINDOW\][^\n]*\n} {
+            set window $expect_out(0,string)
             exp_continue
         }
-        -re "workload rc=(\\d+)" {
-            set workload_rc $expect_out(1,string)
+        -re {workload rc=([0-9]+)} {
+            set rc $expect_out(1,string)
             set saw_rc 1
-            puts "===== Workload finished with return code $workload_rc"
             exp_continue
         }
         -re "$PROMPT" {
             if {!$saw_rc} {
-                puts "\n!!! prompt seen before 'workload rc=' - treating as incomplete, not reporting a window"
-                lappend results [list $name $mig_state "NO_RC_SEEN" "" ""]
+                puts "!!! prompt arrived before 'workload rc=' - incomplete, no window reported"
+                record $pt $mig $rep "NO_RC" $rc {}
                 return 0
             }
-            puts "===== Benchmark phase finished."
         }
         timeout {
-            puts "\n!!! workload timed out after ${WORK_TMO}s"
-            lappend results [list $name $mig_state "TIMEOUT" "" ""]
+            puts "!!! timed out after ${WORK_TMO}s"
+            record $pt $mig $rep "TIMEOUT" $rc {}
             return 0
         }
     }
-
-    if {$sbc_line eq ""} {
-        puts "\n!!! no \[SBC-WINDOW\] line seen even though rc=$workload_rc - not reporting a window"
-        lappend results [list $name $mig_state "NO_WINDOW" "" ""]
+    if {$window eq ""} {
+        puts "!!! rc=$rc but no \[SBC-WINDOW\] line - no window reported"
+        record $pt $mig $rep "NO_WINDOW" $rc {}
         return 0
     }
 
-    lappend results [list $name $mig_state "OK (rc=$workload_rc)" $sec_hits $sbc_line]
+    set m [parse_counters $window]
+    set missing [list]
+    foreach k $NEEDED { if {![dict exists $m $k]} { lappend missing $k } }
+    if {[llength $missing] > 0} {
+        puts "!!! the \[SBC-WINDOW\] line is missing [join $missing {, }] - not reporting a window"
+        puts "!!! captured: $window"
+        record $pt $mig $rep "PARTIAL" $rc $m
+        return 0
+    }
+    record $pt $mig $rep "OK" $rc $m
+    puts [format "──── rc=%s  memAcc=%s  L2_Cycles=%s  accessA=%s  migrations=%s  secHits=%s  parked=%s" \
+          $rc [expr {[dget $m memReads 0] + [dget $m memWrites 0]}] \
+          [dget $m L2_Cycles] [dget $m accessA] [dget $m migrations] [dget $m secHits] \
+          [dget $m parked]]
     return 1
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 1: Program FPGA
-# ──────────────────────────────────────────────────────────────────────────────
-if {$DO_PROG} {
-    if {![file exists $BIT]} {
-        puts "ERROR: Missing bitstream: $BIT"
-        exit 1
+# Run the whole plan on one side of the migrate switch.
+set consec_fail 0
+set runs_done   0
+
+proc run_phase {mig} {
+    global PLANNED REPEAT SBC DO_RESETALL
+    banner "PHASE migrate=$mig - [llength $PLANNED] point(s), $REPEAT run(s) each"
+
+    board_run "$SBC --migrate=$mig"
+    if {$DO_RESETALL} {
+        # Drops the saturation / DSS / AT heat accumulated before this phase. Legal only while
+        # nothing is parked - true with the switch off, and true at the OFF->ON boundary because
+        # the OFF phase cannot park anything. If it refuses, say so and carry on.
+        if {[board_probe "$SBC --reset-all"] != 0} {
+            puts "===== (--reset-all declined - lines still parked; continuing without it)"
+        }
     }
-    puts "===== \[1/5\] Killing any serial processes before FPGA programming ..."
+
+    foreach pt $PLANNED {
+        set exe [lindex [split [dict get $pt cmd]] 0]
+        if {[board_probe "test -x $exe"] != 0} {
+            puts "\n!!! $exe is not on the board - skipping [dict get $pt label]"
+            record $pt $mig 1 "MISSING" "?" {}
+            continue
+        }
+        for {set rep 1} {$rep <= $REPEAT} {incr rep} {
+            if {[measure $pt $mig $rep]} {
+                set ::consec_fail 0
+            } else {
+                incr ::consec_fail
+            }
+            incr ::runs_done
+            # A rig that cannot produce a window will not start producing one on run 40. Fail on
+            # the first run, or after three in a row, rather than spending an hour proving it.
+            if {$::consec_fail >= 3 || ($::runs_done == 1 && $::consec_fail == 1)} {
+                bail "$::consec_fail run(s) in a row produced no measurement window - stopping\
+instead of running the rest of the plan. Check $SBC on the board and the transcript above."
+            }
+            board_run "sleep 2"
+        }
+    }
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 1 - program the FPGA
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+if {$DO_PROG} {
+    if {![file exists $BIT]} { puts "ERROR: missing bitstream: $BIT" ; exit 1 }
+    puts "\n===== \[1/5\] programming the FPGA (Vivado, a few minutes) ..."
     catch { exec pkill -f "picocom.*ttyUSB" }
     catch { exec pkill -f "screen.*ttyUSB" }
     sleep 1
 
-    puts "===== \[1/5\] Programming FPGA with Vivado (may take a few minutes) ..."
     set timeout 900
     spawn bash "$SCRIPTS/programFPGA.sh" $BIT
     expect {
-        "FPGA programming complete!"  { puts "\n===== FPGA programmed successfully." }
-        "ERROR"                       { puts "\n!!! Vivado error programming FPGA"; exit 1 }
-        timeout                       { puts "\n!!! Vivado programming timed out"; exit 1 }
-        eof                           { puts "\n!!! programFPGA.sh exited"; }
+        "FPGA programming complete!" { puts "===== FPGA programmed." }
+        "ERROR"   { puts "\n!!! Vivado error programming the FPGA" ; exit 1 }
+        timeout   { puts "\n!!! Vivado programming timed out" ; exit 1 }
+        eof       { puts "\n!!! programFPGA.sh exited early" }
     }
     catch { expect eof }
 } else {
-    puts "===== \[1/5\] Skipping FPGA programming (-noprog)"
+    puts "\n===== \[1/5\] skipping FPGA programming (-noprog)"
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 2: Open serial console
-# ──────────────────────────────────────────────────────────────────────────────
-puts "===== \[2/5\] Opening serial console ($DEVICE) ..."
-set timeout 60
-if {![file exists $DEVICE]} {
-    puts "\n!!! $DEVICE not found. Waiting up to 15s for device to appear..."
-    for {set retries 0} {$retries < 15} {incr retries} {
-        sleep 1
-        if {[file exists $DEVICE]} { break }
-    }
-    if {![file exists $DEVICE]} {
-        puts "\n!!! $DEVICE still not present. Check FPGA connection."
-        exit 1
-    }
-}
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 2 - open the serial console
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+puts "\n===== \[2/5\] opening the serial console ($DEVICE) ..."
+for {set tries 0} {![file exists $DEVICE] && $tries < 15} {incr tries} { sleep 1 }
+if {![file exists $DEVICE]} { puts "\n!!! $DEVICE never appeared - check the FPGA connection" ; exit 1 }
 
 catch { exec pkill -f "picocom.*ttyUSB" }
 sleep 1
 
+# TERM=dumb before the spawn, deliberately. picocom 3.1 draws its "*** file:" prompt through
+# linenoise, and on a terminal it believes is capable linenoise measures the width by writing
+# ESC[6n / ESC[999C / ESC[6n and blocking on the replies. Under expect nothing answers, so the
+# prompt never appears and the transfer is lost; answer those queries badly and linenoise computes
+# a one-column terminal and dies in realloc(). On TERM=dumb linenoise skips all of that and reads
+# the line with fgets, which is all this script ever needed. (Both failure modes cost a run on
+# 2026-10-02 - see the ESC[6n handler in zmodem_send, which stays as a backstop.)
+set env(TERM) dumb
+
+set timeout 60
 spawn picocom -b $BAUD --send-cmd $SEND_CMD --receive-cmd $RECV_CMD $DEVICE
+# The default 2000-byte match buffer is uncomfortably close to the length of a [SBC-WINDOW] line
+# plus whatever shares the buffer with it.
+match_max 20000
+
 expect {
-    "Terminal ready" { puts "\n===== picocom ready." }
+    "Terminal ready" { puts "===== picocom ready." }
     -re "cannot open|Device or resource busy|No such file" {
-        puts "\n!!! picocom could not open $DEVICE"; exit 1
+        puts "\n!!! picocom could not open $DEVICE" ; exit 1
     }
-    timeout { puts "\n!!! picocom never became ready"; exit 1 }
+    timeout { puts "\n!!! picocom never became ready" ; exit 1 }
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 3: Wait for Linux boot & login
-# ──────────────────────────────────────────────────────────────────────────────
-puts "===== \[3/5\] Waiting for Linux to boot ..."
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 3 - wait for Linux, log in
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+puts "\n===== \[3/5\] waiting for Linux to boot ..."
+
+# Cancel any half-finished ZMODEM transfer before trying to talk to the shell. If a previous
+# session died mid-transfer the board is still sitting inside rz, answering with 'C' and "Retry 1:
+# Got 015 sector header" instead of a prompt, and it will stay there until rz times out. Eight CANs
+# and some backspaces is the standard ZMODEM abort; harmless when nothing is in progress.
+send "\x18\x18\x18\x18\x18\x18\x18\x18\b\b\b\b\b\b\b\b\b\b"
+
 set timeout $BOOT_TMO
 send "\r"
 expect {
-    -re "Welcome to Buildroot" { puts "\n===== Buildroot banner detected."; exp_continue }
-    -re "login:"        { send -s "$LOGIN\r"; exp_continue }
-    -re "Password:"     { send -s "$PASSWORD\r"; exp_continue }
-    -re "\n$PROMPT"     { puts "\n===== Shell prompt ready." }
-    -re "^$PROMPT"      { puts "\n===== Shell prompt ready." }
-    -re {\[ *[0-9]+\.[0-9]+\]}          { exp_continue }
-    -re "INIT|CMD|LOADING|BOOT"          { exp_continue }
-    -re "Linux version|Starting"         { exp_continue }
-    -re "Kernel panic|Oops:|Unable to mount" { puts "\n!!! Kernel panic / boot failure"; exit 1 }
-    timeout { puts "\n!!! Timeout (${BOOT_TMO}s) waiting for Linux boot."; exit 1 }
+    -re "Welcome to Buildroot"                { puts "===== Buildroot banner." ; exp_continue }
+    -re "login:"                              { send -s "$LOGIN\r" ; exp_continue }
+    -re "Password:"                            { send -s "$PASSWORD\r" ; exp_continue }
+    -re "\n$PROMPT"                           { puts "===== shell prompt ready." }
+    -re "^$PROMPT"                            { puts "===== shell prompt ready." }
+    -re {\[ *[0-9]+\.[0-9]+\]}                { exp_continue }
+    -re "INIT|CMD|LOADING|BOOT"               { exp_continue }
+    -re "Linux version|Starting"              { exp_continue }
+    -re "Kernel panic|Oops:|Unable to mount"  { puts "\n!!! kernel panic / boot failure" ; exit 1 }
+    timeout { puts "\n!!! timeout (${BOOT_TMO}s) waiting for Linux to boot" ; exit 1 }
 }
 
-if {![board_cmd "stty sane 2>/dev/null || true"]} { bail "failed stty sane" }
-expect -re "$PROMPT"
-if {![board_cmd "cd /root"]} { bail "failed cd /root" }
-expect -re "$PROMPT"
+board_run "stty sane 2>/dev/null || true"
+board_run "cd /root"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 4: Mount SD, transfer sbc_read + benchmarks
-# ──────────────────────────────────────────────────────────────────────────────
-puts "\n===== \[4/5\] Mount SD, transfer tools + benchmark binaries ..."
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 4 - mount the SD card, stage sbc_read and the workloads
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+puts "\n===== \[4/5\] mounting the SD card and staging the workloads ..."
 
-board_cmd "mkdir -p /mnt && if ! grep -q ' /mnt ' /proc/mounts; then if test -b /dev/mmcblk0p2; then mount /dev/mmcblk0p2 /mnt; elif test -b /dev/mmcblk0p1; then mount /dev/mmcblk0p1 /mnt; else mount /dev/mmcblk0 /mnt 2>/dev/null || true; fi; fi"
-expect -re "$PROMPT"
-board_cmd "mkdir -p /root/parsec"
-expect -re "$PROMPT"
+# 600s, not the 60s default: if the card was not unmounted cleanly the kernel runs an EXT4
+# journal recovery first, and that is not quick on this board - it took 105s on 2026-10-02, so
+# the mount outlived its timeout and the next command went into a shell that was still busy.
+board_run "mkdir -p /mnt && if ! grep -q ' /mnt ' /proc/mounts; then if test -b /dev/mmcblk0p2; then mount /dev/mmcblk0p2 /mnt; elif test -b /dev/mmcblk0p1; then mount /dev/mmcblk0p1 /mnt; else mount /dev/mmcblk0 /mnt 2>/dev/null || true; fi; fi" 600
+board_run "mkdir -p $BOARD_DIR"
 
-if {!$SKIP_PUSH} {
-    board_cmd {test -x /root/sbc_read ; echo check_sbc=$?}
-    expect {
-        -re "check_sbc=0" { expect -re "$PROMPT" }
-        -re "check_sbc=1" {
-            expect -re "$PROMPT"
-            board_cmd "test -x /mnt/sbc_read && cp /mnt/sbc_read /root/ && chmod +x /root/sbc_read || true"
-            expect -re "$PROMPT"
-            board_cmd {test -x /root/sbc_read ; echo check_sbc_mnt=$?}
-            expect {
-                -re "check_sbc_mnt=0" { expect -re "$PROMPT" }
-                -re "check_sbc_mnt=1" {
-                    expect -re "$PROMPT"
-                    zmodem_send "$SW_DIR/build/sbc_read"
-                    board_cmd "cp /root/sbc_read /mnt/ 2>/dev/null || true"
-                    expect -re "$PROMPT"
-                }
-            }
+# sbc_read lives in /root, not with the workloads, and comes out of the cache build tree rather
+# than the staged PARSEC directory - hence its own staging proc.
+proc stage_sbc_read {} {
+    global SW_DIR PUSH
+    board_run "cd /root"
+    set host "$SW_DIR/build/sbc_read"
+    if {$PUSH eq "none"} {
+        # -skippush still pays for one md5: this is the file whose silent corruption cost the
+        # 2026-10-01 sweep, and finding out now beats finding out 72 runs later.
+        if {![board_matches sbc_read $host]} {
+            bail "/root/sbc_read does not match the host's build. Re-run without -skippush."
         }
+        puts "---- sbc_read on the board matches the host"
+        board_run "chmod +x sbc_read"
+        return
     }
+    stage_one sbc_read $host "/mnt/sbc_read" 1
+}
 
-    board_cmd "cd /root/parsec"
-    expect -re "$PROMPT"
+# Does this board have md5sum, and does this host? If either does not, board_matches falls back
+# to a byte count. Probed once, here, rather than per file.
+if {![catch {exec md5sum /dev/null}]} {
+    set HAVE_MD5 [expr {[board_probe "md5sum /dev/null > /dev/null 2>&1"] == 0}]
+}
+puts "===== file comparison: [expr {$HAVE_MD5 ? {md5sum} : {byte count (no md5sum on the board)}}]"
 
-    foreach app $APPS {
-        set name  [lindex $app 0]
-        set exe   [lindex $app 1]
-        set extra [lindex $app 2]
-
-        puts "\n----- staging $name ..."
-        stage_file $exe "$STAGED/$exe" 1
-        foreach f $extra {
-            if {$f eq "sequenceB_1.tar.gz"} {
-                board_cmd {test -d sequenceB_1 ; echo check_seqb=$?}
-                expect {
-                    -re "check_seqb=0" { expect -re "$PROMPT" }
-                    -re "check_seqb=1" {
-                        expect -re "$PROMPT"
-                        stage_file "sequenceB_1.tar.gz" "$STAGED/sequenceB_1.tar.gz" 0
-                        board_cmd "tar -xzf sequenceB_1.tar.gz"
-                        expect -re "$PROMPT"
-                    }
-                }
-            } else {
-                stage_file $f "$STAGED/$f" 0
-            }
-        }
-    }
-
-    board_cmd "mkdir -p /mnt/parsec && cp -r /root/parsec/* /mnt/parsec/ 2>/dev/null || true"
-    expect -re "$PROMPT"
-    board_cmd "cd /root"
-    expect -re "$PROMPT"
+stage_sbc_read
+if {$PUSH eq "none"} {
+    puts "===== staging nothing (-skippush) - the plan's binaries must already be on the board"
 } else {
-    puts "\n===== \[4/5\] Skipping file push (-skippush)"
+    board_run "cd $BOARD_DIR"
+    # One stage per distinct benchmark, however many points of the plan use it.
+    set staged_benches [list]
+    foreach pt $PLANNED {
+        set id [dict get $pt bench]
+        if {[lsearch -exact $staged_benches $id] >= 0} { continue }
+        lappend staged_benches $id
+        puts "\n---- staging $id ..."
+        bench_${id}_stage
+    }
+    # The per-file cache writes in stage_one cover the binaries; this catches what they cannot,
+    # such as bodytrack's extracted sequenceB_1 tree.
+    board_run "mkdir -p /mnt/parsec && cp -r $BOARD_DIR/* /mnt/parsec/ 2>/dev/null || true" 300
+    puts "\n===== staged [format %.2f [expr {$pushed_bytes / 1048576.0}]] MB from the host"
 }
 
-puts "\n===== Verifying SBC hardware ..."
-if {![board_cmd "/root/sbc_read"]} { bail "failed to run /root/sbc_read" }
+# Flush what staging just wrote and let the board go quiet. Without this the first runs of the
+# session are measured against a core that is also doing EXT4 writeback of the files we just
+# pushed: on 2026-10-02 the first three runs took 66s, 93s and 27s of an ~19s workload, with
+# accessA 5x the normal figure at a 90%+ hit rate - a kernel working set, not LU's - while memAcc
+# barely moved. That contaminated the OFF half of the very first point in the plan, and since the
+# ON half ran an hour later on a quiet board, the pair failed the same-work check.
+board_run "sync" 600
+board_run "sleep 15"
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# STEP 5 - check the hardware, then run both phases
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+puts "\n===== \[5/5\] checking the SBC hardware ..."
+board_run "cd /root"
+if {![board_cmd $SBC]} { bail "could not run $SBC" }
 set sbc_built -1
-set found_policy "unknown"
+set live_policy "unknown"
+set timeout 60
 expect {
-    -re {migrate *: *(ON|OFF)}     { set sbc_built 1; exp_continue }
-    -re {migrate *: *n/a}          { set sbc_built 0; exp_continue }
-    -re {policy *: *(random|plru)} { set found_policy $expect_out(1,string); exp_continue }
+    -re {migrate *: *(ON|OFF)}     { set sbc_built 1 ; exp_continue }
+    -re {migrate *: *n/a}          { set sbc_built 0 ; exp_continue }
+    -re {policy *: *(random|plru)} { set live_policy $expect_out(1,string) ; exp_continue }
     -re "$PROMPT"                  { }
-    timeout                        { puts "\n(warning: sbc_read status read timed out)" }
+    timeout { puts "(warning: the sbc_read status read timed out)" }
 }
-puts "===== SBC built: $sbc_built, policy: $found_policy"
-
-# The hardware's L2_Replacement register resets to 0 (random) on every FPGA reprogram, even when the
-# bitstream was built with plruReplacement=true - it must be set explicitly every session, it does not
-# follow from the bitstream alone. Omitting -policy here silently runs under random replacement.
-if {$POLICY ne ""} {
-    puts "===== Setting policy=$POLICY ..."
-    board_cmd "/root/sbc_read --policy=$POLICY"
-    expect -re "$PROMPT"
+# Three outcomes, three answers. -1 means sbc_read told us nothing at all, which is not a shrug:
+# it means the thing on the board is not sbc_read, and every run after it would be a silent rc=0.
+if {$sbc_built == 1} {
+    puts "===== SBC present in this bitstream; policy right now: $live_policy"
+} elseif {$sbc_built == 0} {
+    bail "the SBC is not built into this bitstream - migrate=on would measure nothing"
+} else {
+    set want [expr {[file exists "$SW_DIR/build/sbc_read"] ? [file size "$SW_DIR/build/sbc_read"] : "?"}]
+    bail "$SBC printed no status at all, so it is not the sbc_read binary (an empty or non-ELF\
+file execs as a silent shell script and exits 0). On the board, compare 'wc -c $SBC' and\
+'wc -c /mnt/sbc_read' against the host's $want bytes."
 }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# STEP 5: Run benchmarks with A/B migration evaluation
-# ──────────────────────────────────────────────────────────────────────────────
-puts "\n===== \[5/5\] Running benchmark evaluation ..."
-board_cmd "cd /root/parsec"
-expect -re "$PROMPT"
-board_cmd "ls -la"
-expect -re "$PROMPT"
+board_run "cd $BOARD_DIR"
+board_run "ls -la"
 
-foreach app $APPS {
-    set name [lindex $app 0]
-    set exe  [lindex $app 1]
-    set cmd  [subst [lindex $app 3]]
+# Every OFF run before any ON run - see PHASE ORDER in the header. -phases narrows this to one
+# side, which is how a session that died part way is finished off: the OFF half it already
+# collected is still good, so only the ON half needs repeating. The pair is then split across two
+# sessions rather than two hours of one, which the same-work check still polices.
+foreach ph $PHASES { run_phase $ph }
 
-    puts "\n===== Running [string toupper $name] ..."
-    board_cmd "test -x ./$exe && echo '${name}_OK' || echo '${name}_MISSING'"
-    expect {
-        -re "${name}_OK" {
-            expect -re "$PROMPT"
-            if {![run_benchmark_phase "$name (Phase 1: Migrate OFF)" $cmd "off"]} {
-                puts "!!! $name Phase 1 (OFF) failed - continuing"
-            }
-            board_cmd "sleep 2"
-            expect -re "$PROMPT"
-            if {![run_benchmark_phase "$name (Phase 2: Migrate ON)" $cmd "on"]} {
-                puts "!!! $name Phase 2 (ON) failed - continuing"
-            }
-            board_cmd "sleep 2"
-            expect -re "$PROMPT"
+board_run "cd /root"
+board_run "$SBC --migrate=off"        ;# leave the board on the baseline side of the switch
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Report
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+proc mean {samples key} {
+    set n 0 ; set s 0
+    foreach m $samples {
+        set v [dget $m $key]
+        if {![string is entier -strict $v]} continue
+        incr n ; set s [expr {$s + $v}]
+    }
+    if {$n == 0} { return "" }
+    return [expr {$s / $n}]
+}
+proc num {v} { return [string is double -strict $v] }
+proc pct {new old} {
+    if {![num $new] || ![num $old] || $old == 0} { return "n/a" }
+    return [format "%+.2f%%" [expr {100.0 * ($new - $old) / double($old)}]]
+}
+proc ratio {a b} {
+    if {![num $a] || ![num $b] || $b == 0} { return "-" }
+    return [format "%.2f" [expr {double($a) / double($b)}]]
+}
+proc pctof {a b} {
+    if {![num $a] || ![num $b] || $b == 0} { return "-" }
+    return [format "%.2f%%" [expr {100.0 * $a / double($b)}]]
+}
+proc hitrate {m} {
+    set a [mean [list $m] accessA]
+    if {![num $a] || $a == 0} { return "-" }
+    return [format "%.2f%%" [expr {100.0 * ([dget $m primaryHit 0] + [dget $m secondaryHit 0]) / double($a)}]]
+}
+proc memacc {m} {
+    set r [dget $m memReads] ; set w [dget $m memWrites]
+    if {![num $r] || ![num $w]} { return "" }
+    return [expr {$r + $w}]
+}
+
+# The mean counters of the OK runs of each (label, migrate) pair, as one averaged dict per side.
+set means [dict create]
+set counts [dict create]
+foreach r $results {
+    if {[dict get $r status] ne "OK"} continue
+    dict lappend raw_samples "[dict get $r label]|[dict get $r migrate]" [dict get $r counters]
+}
+if {![info exists raw_samples]} { set raw_samples [dict create] }
+foreach key [dict keys $raw_samples] {
+    set samples [dict get $raw_samples $key]
+    set avg [dict create]
+    foreach c $CSV_COLS { dict set avg $c [mean $samples $c] }
+    dict set means $key $avg
+    dict set counts $key [llength $samples]
+}
+
+banner "RESULTS - plan '$PLAN'"
+
+# ── every run, as it happened ──
+set fmt "  %-24s %-3s %-3s %-9s %-3s %-11s %-10s %-12s %-7s %-7s %-6s"
+puts ""
+puts [format $fmt POINT MIG RUN STATUS RC accessA memAcc L2_Cycles migr secHits parked]
+puts [format $fmt ------------------------ --- --- --------- -- ----------- ---------- ------------ ------- ------- ------]
+foreach r $results {
+    set m [dict get $r counters]
+    puts [format $fmt [dict get $r label] [dict get $r migrate] [dict get $r rep] \
+          [dict get $r status] [dict get $r rc] [dget $m accessA] [memacc $m] [dget $m L2_Cycles] \
+          [dget $m migrations] [dget $m secHits] [dget $m parked]]
+}
+
+# ── what the switch did: OFF vs ON, averaged over the repeats ──
+set pairs [list]
+set seen  [list]
+foreach pt $PLANNED {
+    set label [dict get $pt label]
+    if {[lsearch -exact $seen $label] >= 0} { continue }
+    lappend seen $label
+    if {![dict exists $means "$label|off"] || ![dict exists $means "$label|on"]} { continue }
+    lappend pairs $pt
+}
+
+if {[llength $pairs] == 0} {
+    puts "\n  (no point has a completed run on both sides of the switch - nothing to compare)"
+} else {
+    set fa "  %-24s %-6s %-5s %-4s %-4s %-11s %-11s %-9s %-12s %-12s %-9s %-9s"
+    puts "\n  TRAFFIC AND TIME, mean of the completed runs. memAcc = memReads + memWrites: the one"
+    puts "  number with no denominator to argue about. workΔ is the same-work check on accessA."
+    puts ""
+    puts [format $fa POINT AXIS runs n b memAcc.off memAcc.on "memΔ" cyc.off cyc.on "cycΔ" "workΔ"]
+    puts [format $fa ------------------------ ------ ----- ---- ---- ----------- ----------- --------- ------------ ------------ --------- ---------]
+    set flagged [list]
+    foreach pt $pairs {
+        set label [dict get $pt label]
+        set off [dict get $means "$label|off"] ; set on [dict get $means "$label|on"]
+        set wd [pct [dget $on accessA] [dget $off accessA]]
+        puts [format $fa $label [dict get $pt axis] \
+              "[dict get $counts "$label|off"]/[dict get $counts "$label|on"]" \
+              [dict get $pt n] [dict get $pt b] \
+              [memacc $off] [memacc $on] [pct [memacc $on] [memacc $off]] \
+              [dget $off L2_Cycles] [dget $on L2_Cycles] \
+              [pct [dget $on L2_Cycles] [dget $off L2_Cycles]] $wd]
+        if {[num [dget $off accessA]] && [dget $off accessA] != 0} {
+            set d [expr {abs([dget $on accessA] - [dget $off accessA]) * 100.0 / double([dget $off accessA])}]
+            if {$d > 2.0} { lappend flagged [format "%s (%.2f%%)" $label $d] }
         }
-        -re "${name}_MISSING" {
-            expect -re "$PROMPT"
-            puts "\n!!! WARNING: $exe not found on board. Skipping $name."
-            lappend results [list $name "off" "MISSING" "" ""]
-            lappend results [list $name "on"  "MISSING" "" ""]
-        }
+    }
+
+    set fb "  %-24s %-9s %-9s %-9s %-7s %-9s %-7s %-9s %-7s %-8s %-9s %-9s"
+    puts "\n  WHAT THE SBC DID in the migrate=on phase. hits/park is secHits/migrations - sbc_read's"
+    puts "  own break-even is about 1.0. abort% is aborted/attempted."
+    puts ""
+    puts [format $fb POINT migrations attempted aborted "abort%" secHits "h/park" secMiss parked dispDrop hit%.off hit%.on]
+    puts [format $fb ------------------------ --------- --------- --------- ------- --------- ------- --------- ------- -------- --------- ---------]
+    foreach pt $pairs {
+        set label [dict get $pt label]
+        set off [dict get $means "$label|off"] ; set on [dict get $means "$label|on"]
+        puts [format $fb $label [dget $on migrations] [dget $on attempted] [dget $on aborted] \
+              [pctof [dget $on aborted] [dget $on attempted]] [dget $on secHits] \
+              [ratio [dget $on secHits] [dget $on migrations]] [dget $on secMiss] \
+              [dget $on parked] [dget $on dispDrop] [hitrate $off] [hitrate $on]]
+    }
+
+    if {[llength $flagged] > 0} {
+        puts "\n  !! SAME-WORK CHECK FAILED (accessA differs by more than 2% between the phases) for:"
+        foreach f $flagged { puts "     $f" }
+        puts "     The traffic and cycle deltas for those points are not an SBC effect. The two"
+        puts "     phases are separated in time by this script's phase order, so suspect drift"
+        puts "     first: re-run those points on their own with -bench <label>."
+    } else {
+        puts "\n  Same-work check passed for every compared point (accessA within 2%)."
     }
 }
 
-board_cmd "cd /root"
-expect -re "$PROMPT"
-board_cmd "/root/sbc_read --migrate=off"
-expect -re "$PROMPT"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# FINAL REPORT
-# ──────────────────────────────────────────────────────────────────────────────
-puts "\n=================================================================="
-puts "===== PARSEC EVALUATION RESULTS"
-puts "=================================================================="
-puts ""
-puts [format "  %-20s %-10s %-14s %-15s" "BENCHMARK" "MIGRATE" "STATUS" "secondary_hits"]
-puts [format "  %-20s %-10s %-14s %-15s" "─────────" "───────" "──────" "──────────────"]
-foreach r $results {
-    puts [format "  %-20s %-10s %-14s %-15s" [lindex $r 0] [lindex $r 1] [lindex $r 2] [lindex $r 3]]
-}
-puts ""
-puts "===== Transcript saved to: $LOGPATH"
-puts "=================================================================="
+puts "\n  transcript : $LOGPATH"
+puts "  csv        : $CSVPATH"
+puts "  plot       : python3 $SCRIPTS/plot_sbc_sweep.py $CSVPATH"
+puts "══════════════════════════════════════════════════════════════════════════════════════\n"
+close $csv_fh
 
 if {$DO_INTERACT} {
-    puts "\n===== HANDING OVER TO INTERACTIVE SESSION (Ctrl-A Ctrl-X to exit)"
+    puts "===== handing over to the interactive session (Ctrl-A Ctrl-X to exit)"
     interact
 } else {
     send "\x01\x18"

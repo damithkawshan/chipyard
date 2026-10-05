@@ -34,6 +34,7 @@
 #   ./run_board_session.exp -poll 60               # long run: sample counters every 60 s
 #   ./run_board_session.exp -tmo 14400             # allow 4 h per workload (default 7200)
 #   ./run_board_session.exp -boottmo 3600          # tolerate a very slow boot (default 1800)
+#   ./run_board_session.exp -migrate on|off        # single phase: set SBC migration switch
 #   ./run_board_session.exp -policy plru           # 008: victim policy (L2_Replacement) random|plru,
 #                                                  #      set after boot and confirmed by read-back.
 #                                                  #      Without it the policy is left as found
@@ -49,7 +50,7 @@ set CY        "/home/damith/Research/repos/chipyard_performance_eval/chipyard"
 set SCRIPTS   "$CY/scripts/ssbc_scripts"
 set GENSRC    "$CY/fpga/generated-src/chipyard.fpga.vcu118.VCU118FPGATestHarness"
 set NOSBC_BIT "$GENSRC.FPGASingleRocketVCU118L18K256K16WL2ConfigNoSbc/obj/VCU118FPGATestHarness.bit"
-set SBC_BIT   "$GENSRC.FPGASingleRocketVCU118L18K256K16WL2ConfigSBCResetEnabled/obj/VCU118FPGATestHarness.bit"
+set SBC_BIT   "/home/damith/Research/repos/chipyard_performance_eval/chipyard/fpga/bitstream_storage/FPGADualRocketVCU118L18K1024K8WL2ConfigSBCPLRU-dual-1MB-8way-2026-09-26.bit"
 
 set SBC_READ  "$CY/generators/rocket-chip-inclusive-cache/sw/build/sbc_read"
 set SW_DIR    "$CY/generators/rocket-chip-inclusive-cache/sw"
@@ -125,7 +126,7 @@ set SETUP [list \
 # benchmark that dies on its first instruction still produces a normal-looking [SBC-WINDOW] dump
 # and the session reports success - a fast "clean" run that measured nothing. rc must be 0.
 set WORKLOADS [list \
-    "(cd $STAGE/$OMNET_SET && /root/sbc_read --zero -- sh -c './$OMNET_BIN -c General -r 0 --sim-time-limit=0.002s --cmdenv-status-frequency=0.001s --cmdenv-performance-display=true 2> wl.err' ; echo \"workload rc=\$?\" ; tail -3 wl.err)" \
+    "(cd $STAGE/$OMNET_SET && /root/sbc_read --zero -- sh -c './$OMNET_BIN -c General -r 0 --sim-time-limit=0.1s --cmdenv-status-frequency=0.001s --cmdenv-performance-display=true 2> wl.err' ; echo \"workload rc=\$?\" ; tail -3 wl.err)" \
 ]
 # Alternatives:
 #   "./sbc_read --zero -- ./$STAGE/memtest"                        - short, runs to completion
@@ -159,7 +160,9 @@ set DO_PROG    1
 set VIA_SCRIPT 0
 set WANT_SBC   1
 # 008: "" = leave L2_Replacement as found (a fresh boot is random); else random|plru.
-set POLICY     ""
+set POLICY     "plru"
+set MIGRATE    "on"
+set MIGRATE_SET 0
 # -ab must not touch BIT: `-bit X -ab` used to program the default SBC bitstream instead of X
 # (2026-09-15: a "64K" A/B ran on the 256K image). BIT already defaults to $SBC_BIT, and A/B mode
 # checks after boot that the loaded image is an SBC build.
@@ -175,6 +178,8 @@ for {set i 0} {$i < $argc} {incr i} {
         "-poll"      { incr i; set POLL [lindex $argv $i] }
         "-tmo"       { incr i; set WORK_TMO [lindex $argv $i] }
         "-boottmo"   { incr i; set BOOT_TMO [lindex $argv $i] }
+        "-migrate"   { incr i; set MIGRATE [string tolower [lindex $argv $i]]; set MIGRATE_SET 1
+                   if {$MIGRATE ne "on" && $MIGRATE ne "off"} { puts "-migrate must be on or off"; exit 2 } }
         "-policy"    { incr i; set POLICY [lindex $argv $i]
                        if {$POLICY ne "random" && $POLICY ne "plru"} { puts "-policy must be random or plru"; exit 2 } }
         default      { puts "unknown arg: $a"; exit 2 }
@@ -214,6 +219,7 @@ if {$AB_MODE} {
     puts "===== mode          : single phase (migrate switch left exactly as found)"
 }
 puts "===== policy        : [expr {$POLICY eq {} ? {as found (reported after boot)} : $POLICY}]"
+puts "===== migration     : $MIGRATE [expr {$AB_MODE ? {(A/B controls this per phase)} : {single phase}}]"
 puts "===== program FPGA  : [expr {$DO_PROG ? {yes (Vivado)} : {no (-noprog, using whatever is loaded)}}]"
 puts "===== serial path   : [expr {$VIA_SCRIPT ? {connect_serial.sh (needs SUDO_PASS)} : {direct picocom}}]"
 puts "===== device / baud : $DEVICE @ $BAUD"
@@ -344,12 +350,16 @@ proc set_policy {want} {
 
 # Run the whole measured set once. Both halves of the A/B call this with an identical WORKLOADS
 # list - if that ever stops being true the comparison is worthless.
-proc run_phase {label} {
-    global WORKLOADS WORK_TMO POLL PROMPT
+proc run_phase {label {mig_arg ""}} {
+    global WORKLOADS WORK_TMO POLL PROMPT STAGE OMNET_SET OMNET_BIN
     puts "\n=================================================================="
     puts "===== PHASE $label"
     puts "=================================================================="
-    foreach w $WORKLOADS {
+    set cur_workloads $WORKLOADS
+    if {$mig_arg ne ""} {
+        set cur_workloads [list "(cd $STAGE/$OMNET_SET && /root/sbc_read --migrate=$mig_arg --zero -- sh -c './$OMNET_BIN -c General -r 0 --sim-time-limit=0.1s --cmdenv-status-frequency=0.001s --cmdenv-performance-display=true 2> wl.err' ; echo \"workload rc=\$?\" ; tail -3 wl.err)"]
+    }
+    foreach w $cur_workloads {
         if {$POLL > 0} {
             puts "\n----- \[$label\] $w   (zero once, then ./sbc_read every ${POLL}s)"
             if {![board_cmd "./sbc_read --zero > /dev/null"]} { return 0 }
@@ -642,13 +652,11 @@ if {$AB_MODE} {
     # Phase 1 - plain-L2 half. Set the switch explicitly rather than trusting the reset default:
     # with -noprog the board may have been left ON by an earlier session.
     if {![set_switch "--migrate=off"]}  { bail "could not put the switch in the OFF position" }
-    if {![run_phase "1/2  migrate OFF  (plain-L2 half)"]} { bail "phase 1 failed" }
+    if {![run_phase "1/2  migrate OFF  (plain-L2 half)" "off"]} { bail "phase 1 failed" }
 
-    # Phase 2 - SBC half. --reset-all drops the heat the saturation counters built up during phase 1
-    # and boot; without it the first migrations fire from stale heat rather than from the benchmark.
-    # It is safe here for exactly one reason: phase 1 parked nothing. sbc_read re-checks that itself.
-    if {![set_switch "--reset-all --migrate=on"]} { bail "could not start the SBC half cleanly" }
-    if {![run_phase "2/2  migrate ON   (SBC half)"]}  { bail "phase 2 failed" }
+    # Phase 2 - SBC half. --zero zeroes the counters before the benchmark run.
+    if {![set_switch "--zero --migrate=on"]} { bail "could not start the SBC half cleanly" }
+    if {![run_phase "2/2  migrate ON   (SBC half)" "on"]}  { bail "phase 2 failed" }
 
     # An SBC half that migrated nothing measured the same thing as phase 1, so the comparison is
     # empty. Better to say so than to let two identical-looking result sets be written up as an A/B.
@@ -689,14 +697,14 @@ if {$AB_MODE} {
     # boot; set_switch turns that refusal into a clean bail rather than a bad measurement.
     # On the NoSbc bitstream there is no switch to set, so leave it alone (-nosbc / -bit).
     if {$WANT_SBC == 1} {
-        puts "\n===== arming: reset SBC state, then migration ON ..."
-        if {![set_switch "--reset-all --migrate=on"]} { bail "could not arm the SBC run" }
+        puts "\n===== arming: zero counters, then migration ON ..."
+        if {![set_switch "--zero --migrate=on"]} { bail "could not arm the SBC run" }
         set phase_label "single  ($DETECTED)  migrate ON"
     } else {
         puts "\n===== switch left as found (not an SBC bitstream)"
         set phase_label "single  ($DETECTED)  switch as found"
     }
-    if {![run_phase $phase_label]} { bail "measurement failed" }
+    if {![run_phase $phase_label $MIGRATE]} { bail "measurement failed" }
 
     # Did migration actually engage? A run with zero commits measured plain L2 under an SBC name.
     puts "\n===== confirming migration actually engaged ..."
