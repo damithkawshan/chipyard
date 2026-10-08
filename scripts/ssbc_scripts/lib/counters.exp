@@ -17,9 +17,15 @@ proc num {v} { return [string is double -strict $v] }
 # Pull every key=number pair out of a counter line. Anchored on "key=", never on field position -
 # see COUNTER PARSING in the session headers. "policy=plru" is not a number, so it drops out on
 # its own.
+#
+# FIX 4.10 (2026-10-06): the value pattern accepts a leading minus. It used to be [0-9]+ only, so
+# a negative counter silently dropped its key rather than being read - and sbc_read documents the
+# "in progress" figure as -38..38 after --zero. Nothing in NEEDED can go negative today, so this
+# was latent rather than live; the failure mode matters though, because a dropped key reads as a
+# MISSING counter (status PARTIAL), not as a bad value.
 proc parse_counters {line} {
     set m [dict create]
-    foreach {all k v} [regexp -all -inline {([A-Za-z_][A-Za-z_0-9]*)=([0-9]+)} $line] {
+    foreach {all k v} [regexp -all -inline {([A-Za-z_][A-Za-z_0-9]*)=(-?[0-9]+)} $line] {
         dict set m $k $v
     }
     return $m

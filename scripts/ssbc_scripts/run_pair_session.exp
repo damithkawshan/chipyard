@@ -103,6 +103,10 @@ set PAIR_SPEC    ""
 set CPU_A        0
 set CPU_B        1
 set SAMECORE     0
+set NPROC        -1      ;# read off the board in step 5, never assumed
+set ALLOW_DIRTY_ON 0     ;# -allow-dirty-on: permit >1 ON window per boot (contaminates; see 1.2)
+set ALLOW_OVERSUB  0     ;# -allow-oversubscribe: permit threads != pinned cpus (see PINNING)
+set MIN_OVERLAP  0.5     ;# a pair run below this is not a pair - see SAFETY LOCK 1.3
 
 # Workload knobs. Each workload reads its own; see the registry below.
 set LU_P   1
@@ -118,7 +122,13 @@ set SC_K2      3
 set SC_DIM     64
 set SC_N       8192
 set SC_CHUNK   8192
+set SC_THREADS 1       ;# must equal the cpus it is pinned to - see CORE COUNT ENFORCEMENT
 set SC_CLUSTER 100
+
+# radix and fft: -p is hard-wired to 1 in the command (one core per workload). Footprint arithmetic
+# for both is in coder/014 REPORT.
+set RADIX_N 65536 ; set RADIX_R 1024 ; set RADIX_M 524288
+set FFT_M   16    ; set FFT_L   4
 
 set CANN_THREADS 1
 set CANN_SWAPS   20000
@@ -146,6 +156,9 @@ for {set i 0} {$i < $argc} {incr i} {
         "-repeat"      { incr i; set REPEAT [lindex $argv $i] }
         "-cpus"        { incr i; lassign [split [lindex $argv $i] ","] CPU_A CPU_B }
         "-samecore"    { set SAMECORE 1 }
+        "-allow-dirty-on"      { set ALLOW_DIRTY_ON 1 }
+        "-allow-oversubscribe" { set ALLOW_OVERSUB 1 }
+        "-min-overlap" { incr i; set MIN_OVERLAP [lindex $argv $i] }
         "-lu-p"        { incr i; set LU_P [lindex $argv $i] }
         "-lu-n"        { incr i; set LU_N [lindex $argv $i] }
         "-lu-b"        { incr i; set LU_B [lindex $argv $i] }
@@ -160,12 +173,31 @@ for {set i 0} {$i < $argc} {incr i} {
         "-sc-n"        { incr i; set SC_N [lindex $argv $i] }
         "-sc-chunk"    { incr i; set SC_CHUNK [lindex $argv $i] }
         "-sc-cluster"  { incr i; set SC_CLUSTER [lindex $argv $i] }
-        default        { puts "unknown arg: $a"; exit 2 }
+        "-sc-threads"  { incr i; set SC_THREADS [lindex $argv $i] }
+        "-radix-n"     { incr i; set RADIX_N [lindex $argv $i] }
+        "-radix-r"     { incr i; set RADIX_R [lindex $argv $i] }
+        "-radix-m"     { incr i; set RADIX_M [lindex $argv $i] }
+        "-fft-m"       { incr i; set FFT_M [lindex $argv $i] }
+        "-fft-l"       { incr i; set FFT_L [lindex $argv $i] }
+        default       { puts "unknown arg: $a"; exit 2 }
     }
 }
 # The -pair spec is validated after the workload registry is defined, further down.
 if {$PUSH ni {always verify none cache}} { puts "-push must be always, verify, cache or none"; exit 2 }
 foreach ph $PHASES { if {$ph ni {off on}} { puts "-phases takes off and/or on"; exit 2 } }
+# SAFETY LOCK 1.1 (2026-10-06). The phase order is not the caller's to choose. An OFF baseline
+# measured after an ON run reads a board that still carries parked lines and a built AT, which
+# biases the comparison in SBC's favour. Audited 2026-10-06 over every result CSV: no session had
+# ever done this, but nothing prevented it. So canonicalise rather than trust the command line.
+# This also collapses a duplicate ("-phases on,on" -> "on").
+set _ph [list]
+if {"off" in $PHASES} { lappend _ph off }
+if {"on"  in $PHASES} { lappend _ph on  }
+if {$_ph ne $PHASES} {
+    puts "---- note: -phases '[join $PHASES {,}]' reordered to '[join $_ph {,}]' -\
+every OFF run must precede any ON run"
+}
+set PHASES $_ph
 if {$POLICY ni {plru random}} { puts "-policy must be plru or random"; exit 2 }
 if {$SAMECORE} { set CPU_B $CPU_A }
 
@@ -178,7 +210,9 @@ if {$SAMECORE} { set CPU_B $CPU_A }
 # Every workload here is single-threaded by default, because a pair on this two-core board gets
 # one core each. See PINNING in the header: the thread count is the workload's own argument and
 # taskset will not change it.
-proc wl_known {} { return {lu streamcluster canneal blackscholes nop} }
+#   canneal has never completed a run on this board (rc=1 both phases, 2026-10) - kept only because
+#   the usage header names it. blackscholes runs 0.17 s: harness smoke test, not a co-runner.
+proc wl_known {} { return {lu lu_cb streamcluster radix fft canneal blackscholes nop} }
 
 # LU n=512 b=128: the geometry the whole campaign is built on. A row is 512*8 = 4096 B = exactly
 # one page, and a 128-column block occupies 16 of the 64 within-page set positions, so ~128 of the
@@ -191,6 +225,29 @@ proc wl_lu_cmd   {} {
     if {$::LU_CHECK} { append c " -t" }   ;# LU's own self-check fails on this board, OFF and ON alike
     return $c
 }
+
+# lu_cb: same algorithm and flags as lu_ncb, but each block is allocated contiguously, so at the
+# same -n/-b it lays a different set-index distribution over the 512 sets. See the note at
+# run_parsec_session.exp:272. Shares LU_N/LU_B deliberately - that is the point of the comparison.
+proc wl_lu_cb_stage {} { stage_file lu_cb }
+proc wl_lu_cb_cmd   {} { return "./lu_cb -p$::LU_P -n$::LU_N -b$::LU_B" }
+
+# radix (SPLASH-2 integer radix sort, staged by task 014). Two key arrays of n*4 B each, so
+# -n 65536 is 512 KB = 2x the 256 KB L2. The permutation phase scatter-writes across the whole
+# array: high-miss AND write-heavy, the closest co-runner to LU's memAcc/accessA of 0.949.
+# -p is fixed at 1 because each workload gets one core (and -p must be a power of two).
+# Keep -r/-m fixed and sweep -n only, so footprint is the one variable. No input file is read.
+proc wl_radix_stage {} { stage_file radix }
+proc wl_radix_cmd   {} { return "./radix -p1 -n$::RADIX_N -r$::RADIX_R -m$::RADIX_M" }
+
+# fft (SPLASH-2 1D FFT, staged by task 014). -m must be EVEN. THREE arrays of
+# 2*(2^m + rootN*pad)*8 B (x, trans, umain2; two are live per phase) - so -m 14 is 520 KB per phase
+# and 780 KB overall, -m 16 is 3 MB overall (12x L2), not 2 MB. -l only changes the row padding for
+# -m >= 14 (below that the page-rounding in fft.C makes -l 4 and -l 6 the same program), and even
+# then it is a modest stride change (4112 B vs 4160 B at -m 16), not an aliasing switch.
+# See coder/014 REPORT findings F1 and F2.
+proc wl_fft_stage {} { stage_file fft }
+proc wl_fft_cmd   {} { return "./fft -p1 -m$::FFT_M -l$::FFT_L" }
 
 # canneal: random pointer chasing over a netlist far larger than the L2, uniform across all 512
 # sets. NSWAPS is per temperature step and is divided among the threads, so the annealing work is
@@ -214,7 +271,7 @@ proc wl_canneal_cmd   {} {
 proc wl_streamcluster_stage {} { stage_file streamcluster }
 proc wl_streamcluster_cmd   {} {
     return "./streamcluster $::SC_K1 $::SC_K2 $::SC_DIM $::SC_N $::SC_CHUNK $::SC_CLUSTER\
- none output.txt 1"
+ none output.txt $::SC_THREADS"
 }
 
 # blackscholes on simdev: 158 K L2 accesses, 84% hit, well under a second. Not a serious
@@ -263,14 +320,29 @@ proc point {label kind wl_a cmd_a cpu_a wl_b cmd_b cpu_b} {
 proc plan_pair {a b} {
     set ca [wl_${a}_cmd]
     set cb [wl_${b}_cmd]
+    # A self-pair (-pair lu,lu) would label BOTH solo points "solo-lu"; find_row matches on the
+    # exact label, so it would average the two into one row and the report would print A and B
+    # identically. Disambiguate ONLY then, so every label of a mixed pair is unchanged and old
+    # CSVs stay comparable.
+    if {$a eq $b} { set la "solo-$a-a" ; set lb "solo-$b-b" } else { set la "solo-$a" ; set lb "solo-$b" }
     set plan [list]
-    lappend plan [point "solo-$a"    solo $a $ca $::CPU_A ""  ""  $::CPU_B]
-    lappend plan [point "solo-$b"    solo $b $cb $::CPU_B ""  ""  $::CPU_B]
+    lappend plan [point $la          solo $a $ca $::CPU_A ""  ""  $::CPU_B]
+    lappend plan [point $lb          solo $b $cb $::CPU_B ""  ""  $::CPU_B]
     lappend plan [point "pair-$a+$b" pair $a $ca $::CPU_A $b  $cb $::CPU_B]
     return $plan
 }
 
-set PLANNED [plan_pair $WL_A $WL_B]
+# FULLPLAN is the plan before -bench filters it. The report takes its labels from here, never by
+# rebuilding label strings: a -bench run (every ON session) keeps only the pair in PLANNED, and the
+# report must still know what the solo rows are called so that it can say they are missing.
+set FULLPLAN [plan_pair $WL_A $WL_B]
+set PLANNED  $FULLPLAN
+set SOLO_LABELS [list]
+foreach pt $FULLPLAN {
+    if {[dict get $pt kind] eq "solo"} { lappend SOLO_LABELS [dict get $pt label] }
+    if {[dict get $pt kind] eq "pair"} { set PAIR_LABEL      [dict get $pt label] }
+}
+lassign $SOLO_LABELS SOLO_A SOLO_B
 
 if {$BENCH_FILTER ne ""} {
     set wanted [split $BENCH_FILTER ","]
@@ -340,13 +412,19 @@ log_file -a $LOGPATH
 
 set NEEDED   {accessA memReads memWrites L2_Cycles migrations secHits}
 set PAIR_COLS {window_s wall_a wall_b overlap_s overlap_frac ra rb}
+# Appended 2026-10-06: memRelClean, memAcqPerm, secWrite, secPerm, secProbe, secC, homeBranch
+# were printed by sbc_read on every run and silently discarded here. memRelClean is the one that
+# matters most - it is the exact complement of memWrites (PerfCounters.scala:133-134, the same
+# io.cFire split on io.cDirty), so without it memWrites had nothing to check it against.
 set CSV_COLS {migrations secHits secMiss attempted aborted parked dispDrop dispRelease \
               accessA primaryHit secondaryHit probedHit dataMiss upgradeMiss \
               secondSearch secondaryMiss memReads memWrites L2_Accesses L2_Hits L2_Cycles \
-              dstAbortDirty dstAbortHeld dstAbortBoth}
+              dstAbortDirty dstAbortHeld dstAbortBoth \
+              memRelClean memAcqPerm secWrite secPerm secProbe secC homeBranch}
 
 set csv_fh [open $CSVPATH w]
-puts $csv_fh [join [concat {label kind wl_a wl_b cpu_a cpu_b policy migrate rep status rc} \
+# CSV LAYOUT CHANGED 2026-10-06: "nproc" inserted after cpu_b. Parse this file by column NAME.
+puts $csv_fh [join [concat {label kind wl_a wl_b cpu_a cpu_b nproc policy migrate rep status rc} \
                            $PAIR_COLS $CSV_COLS] ","]
 flush $csv_fh
 
@@ -378,6 +456,32 @@ if {"on" in $PHASES} {
            "baseline the moment the first ON run finishes. Reboot before the next OFF." \
            "If more than one ON label is in the plan, the later ones inherit the earlier" \
            "ones' migrated lines and AT - which is what produced the bogus -13% on 2026-10-04."
+
+    # SAFETY LOCK 1.2 (2026-10-06). The banner above used to be the only protection, and it is
+    # advisory: the script warned and then ran anyway. Audited 2026-10-06: seven sessions had
+    # already measured more than one ON window on a single boot, including
+    # lu_runs_20261002-010911 with THIRTY-SIX of them (0 reprograms, 0 boots in that transcript),
+    # which is the ON half of the documented 72-run sweep. The bias is not a fixed offset - it
+    # grows with position in the sequence, so cross-configuration comparisons inside such a table
+    # mix the configuration effect with the position effect. Controlled measurement 2026-10-04:
+    # warm ON reported -13.1%/-10.0% where three cold boots of the same point gave
+    # -4.45%/-3.50%/-3.44%, so contamination flatters SBC.
+    set _on_windows [expr {[llength $PLANNED] * $REPEAT}]
+    if {$_on_windows > 1 && !$ALLOW_DIRTY_ON} {
+        puts "\n!!! REFUSING: this plan would run $_on_windows migrate=on windows on one boot"
+        puts "!!!   labels : [llength $PLANNED] ([join $labels {, }])"
+        puts "!!!   repeat : $REPEAT"
+        puts "!!! Only the FIRST would be measured on a clean board. Every later one inherits the"
+        puts "!!! earlier ones' parked lines and AT, and no software reset undoes that."
+        puts "!!!"
+        puts "!!! Run one ON window per boot instead:"
+        puts "!!!   -phases on -bench <one label> -repeat 1 -prog <bitstream>"
+        puts "!!! and repeat the whole invocation, reprogramming between each."
+        puts "!!!"
+        puts "!!! If you genuinely want a warm-cache sequence, pass -allow-dirty-on and do not"
+        puts "!!! compare the resulting rows against anything measured cold."
+        exit 2
+    }
 }
 
 # ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -421,12 +525,74 @@ proc record {pt mig rep status rc counters pairm} {
     lappend results [dict merge $pt [dict create migrate $mig rep $rep status $status rc $rc \
                                                  counters $counters pairm $pairm]]
     set row [list [dict get $pt label] [dict get $pt kind] [dict get $pt wl_a] [dict get $pt wl_b] \
-                  [dict get $pt cpu_a] [dict get $pt cpu_b] [dict get $pt policy] \
+                  [dict get $pt cpu_a] [dict get $pt cpu_b] $::NPROC [dict get $pt policy] \
                   $mig $rep $status $rc]
     foreach c $PAIR_COLS { lappend row [dget $pairm $c] }
     foreach c $CSV_COLS  { lappend row [dget $counters $c] }
     puts $csv_fh [join $row ","]
     flush $csv_fh
+}
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Counter self-consistency
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# Returns "" when the window's counters account for themselves, or a human-readable fault.
+# Every relation here was established empirically over the 34 measured windows on disk as of
+# 2026-10-06, not assumed from the RTL:
+#
+#   primaryHit + secondaryHit + dataMiss + upgradeMiss == accessA      34/34 exact
+#   memReads + memAcqPerm                 == dataMiss                 34/34 exact (memAcqPerm 0)
+#   memReads + memAcqPerm == memWrites + memRelClean   (migrate=off)   30/30 exact, zero slack
+#   fills - announced evictions <= migrations          (migrate=on)     4/4  under
+#
+# The migrate=on gap exists because a migration frees a way without announcing an eviction, so a
+# refill can take that way with no outer C fire. Measured gaps 503 / 13,295 / 252,146 / 269,857
+# against migrations 504 / 15,001 / 256,518 / 274,316.
+#
+# probedHit is deliberately absent: it is a SUBSET of the hits, already inside primary/secondary
+# (sbc_read's "part of the hits"), which is why the first identity closes exactly while probedHit
+# is nonzero on 21 of the 34 rows. Adding it anywhere would double-count.
+#
+# Tolerance 64 everywhere, for accesses in flight across the window boundary - sbc_read documents
+# the in-progress figure as 0..38 from reset and -38..38 after --zero, and there are 38 MSHRs.
+proc counter_fault {m mig} {
+    set acc [dget $m accessA 0]
+    set out [expr {[dget $m primaryHit 0] + [dget $m secondaryHit 0] \
+                 + [dget $m dataMiss 0]   + [dget $m upgradeMiss 0]}]
+    if {abs($acc - $out) > 64} {
+        return "primary+secondary+dataMiss+upgradeMiss = $out but accessA = $acc\
+ (gap [expr {$acc - $out}], tolerance 64): the counters did not account for every access"
+    }
+    set fills [expr {[dget $m memReads 0] + [dget $m memAcqPerm 0]}]
+    if {$fills != [dget $m dataMiss 0]} {
+        return "memReads+memAcqPerm = $fills but dataMiss = [dget $m dataMiss 0]:\
+ memAcc is not a clean miss-traffic figure"
+    }
+    set wr    [dget $m memWrites 0]
+    set cl    [dget $m memRelClean 0]
+    set evgap [expr {$fills - ($wr + $cl)}]
+    if {$evgap < -64} {
+        return "more evictions announced ($wr dirty + $cl clean) than ways filled ($fills):\
+ memWrites/memRelClean are not counting evictions"
+    }
+    if {$mig eq "off" && abs($evgap) > 64} {
+        return "migrate=off, but fills ($fills) != announced evictions ([expr {$wr + $cl}]),\
+ gap $evgap - with no migrations nothing can explain it"
+    }
+    if {$mig eq "on" && $evgap > [expr {[dget $m migrations 0] + 64}]} {
+        return "evictionless fills ($evgap) exceed migrations ([dget $m migrations 0]):\
+ each migration frees at most one way without an eviction"
+    }
+    return ""
+}
+
+# The dirty share of announced evictions. A stable per-workload fingerprint - measured 2026-10-06:
+# LU alone 77-79%, streamcluster alone 10-17%, the pair 50-54%. This is what makes a drift in
+# memWrites visible, since memWrites alone has no scale to be judged against.
+proc dirtyfrac {r} {
+    set wr [c_of $r memWrites] ; set cl [c_of $r memRelClean]
+    if {$wr + $cl == 0} { return "n/a" }
+    return [format %.1f [expr {100.0 * $wr / ($wr + $cl)}]]
 }
 
 # One measured run. sbc_read sets the switch and the policy, zeroes the counters, then forks and
@@ -440,9 +606,14 @@ proc measure {pt mig rep} {
     puts "\n──────────────────────────────────────────────────────────────────────────────────────"
     puts "──── $label   migrate=$mig  policy=[dict get $pt policy]  run $rep/$REPEAT"
 
+    # FIX 4.9 (2026-10-06). Completion used to be signalled by the bare prompt "# ", matched
+    # anywhere in the stream, so any workload that printed "# " aborted the run as NO_RC. The
+    # completion signal is now a per-run token, the same trick board_probe uses: the command's own
+    # echo shows the literal "$?", which is not a digit, so the echo cannot satisfy the match.
+    set tok "WL[incr ::wl_seq]"
     set full "$SBC --migrate=$mig --policy=[dict get $pt policy] --zero --"
     append full " sh $PAIR_SH [dict get $pt cpu_a] \"$ca\" [dict get $pt cpu_b] \"$cb\""
-    append full " ; echo \"workload rc=\$?\""
+    append full " ; echo \"$tok workload rc=\$?\""
     puts "──── $full"
 
     if {![board_cmd $full]} { record $pt $mig $rep "SEND_FAIL" "?" {} {} ; return 0 }
@@ -452,13 +623,13 @@ proc measure {pt mig rep} {
     expect {
         -re {\[SBC-WINDOW\][^\n]*\n} { set window $expect_out(0,string) ; exp_continue }
         -re {\[PAIR-TIME\][^\n]*\n}  { set ptime  $expect_out(0,string) ; exp_continue }
-        -re {workload rc=([0-9]+)}   { set rc $expect_out(1,string) ; set saw_rc 1 ; exp_continue }
-        -re "$PROMPT" {
-            if {!$saw_rc} {
-                puts "!!! prompt arrived before 'workload rc=' - incomplete, no window reported"
-                record $pt $mig $rep "NO_RC" $rc {} {}
-                return 0
-            }
+        -re "$tok workload rc=(\[0-9\]+)" { set rc $expect_out(1,string) ; set saw_rc 1 ; exp_continue }
+        -re "\n$PROMPT" {
+            # Anchored to the start of a line, and only believed once the token has been seen. A
+            # prompt-looking string in workload output therefore cannot end the run early; a run
+            # that really never completes is caught by the timeout below instead, which is slower
+            # but cannot discard a good measurement.
+            if {!$saw_rc} { exp_continue }
         }
         timeout {
             puts "!!! timed out after ${WORK_TMO}s"
@@ -480,6 +651,13 @@ proc measure {pt mig rep} {
     set m     [parse_counters $window]
     set pairm [pair_metrics [parse_pair $ptime]]
 
+    set fault [counter_fault $m $mig]
+    if {$fault ne ""} {
+        puts "!!! counter self-consistency failed: $fault"
+        puts "!!! refusing to report this window"
+        record $pt $mig $rep "COUNTER_IDENTITY" $rc $m $pairm
+        return 0
+    }
     set missing [list]
     foreach k $NEEDED { if {![dict exists $m $k]} { lappend missing $k } }
     if {[llength $missing] > 0} {
@@ -502,11 +680,38 @@ proc measure {pt mig rep} {
         record $pt $mig $rep "PARTNER_FAIL" $rc $m $pairm
         return 0
     }
+    # SAFETY LOCK 1.3 (2026-10-06). overlap_frac is how much of the window really had BOTH
+    # workloads running. A run at 0.10 is one workload plus a bystander for the other 90%, and it
+    # used to be recorded OK and averaged into the pair mean - the only protection was a warning
+    # printed at report time, after the mean had already been computed. Gate it here instead, so a
+    # non-overlapping run can never reach find_row.
+    if {[dict get $pt kind] eq "pair"} {
+        set _ov [dget $pairm overlap_frac NA]
+        if {![num $_ov]} {
+            puts "!!! no overlap fraction for a pair run - refusing to average it in"
+            record $pt $mig $rep "NO_OVERLAP" $rc $m $pairm
+            return 0
+        }
+        if {$_ov < $::MIN_OVERLAP} {
+            puts "!!! the two workloads overlapped for only [format %.1f [expr {$_ov*100}]]% of the\
+window (floor is [format %.0f [expr {$::MIN_OVERLAP*100}]]%) - this is not a pair measurement."
+            puts "!!! Re-size the partner so the two run for comparable times, then repeat."
+            record $pt $mig $rep "LOW_OVERLAP" $rc $m $pairm
+            return 0
+        }
+    }
 
     record $pt $mig $rep "OK" $rc $m $pairm
     puts [format "──── rc=%s  memAcc=%s  L2_Cycles=%s  accessA=%s  migrations=%s  parked=%s" \
           $rc [expr {[dget $m memReads 0] + [dget $m memWrites 0]}] \
           [dget $m L2_Cycles] [dget $m accessA] [dget $m migrations] [dget $m parked]]
+    # evictions, split dirty/clean. memWrites on its own has no scale to be judged against; the
+    # dirty share is a stable per-workload fingerprint, so a drift in memWrites shows up here.
+    set _ev [expr {[dget $m memWrites 0] + [dget $m memRelClean 0]}]
+    puts [format "──── evictions=%s (dirty %s + clean %s, %s%% dirty)  fills=%s" \
+          $_ev [dget $m memWrites 0] [dget $m memRelClean 0] \
+          [expr {$_ev == 0 ? "n/a" : [format %.1f [expr {100.0 * [dget $m memWrites 0] / $_ev}]]}] \
+          [expr {[dget $m memReads 0] + [dget $m memAcqPerm 0]}]]
     puts [format "──── window=%ss  wall_a=%ss  wall_b=%ss  overlap=%ss (%s of the window)" \
           [dget $pairm window_s] [dget $pairm wall_a] [dget $pairm wall_b] \
           [dget $pairm overlap_s] [dget $pairm overlap_frac]]
@@ -707,7 +912,49 @@ if {[board_probe "busybox taskset -c 0 /bin/true"] != 0} {
 would measure an unpinned pair. Check the busybox applet list."
 }
 puts "===== busybox taskset -c 0 works"
-board_run "busybox nproc"
+
+# CORE COUNT ENFORCEMENT (2026-10-06). nproc used to be printed and nothing more, so a plan could
+# name a cpu the board does not have, or give a workload more threads than cpus it is pinned to.
+# The second case is the dangerous one: taskset cannot shrink a workload (see PINNING in the
+# header), so -p2 pinned to one cpu oversubscribes that cpu rather than running two-wide, and LU's
+# L2 traffic is not constant in -p (accessA 12.88M at -p1 vs 14.05M at -p2, same n and b). The
+# echoed command shows "$(" , which is not a digit, so the echo cannot satisfy the match.
+if {[board_cmd "echo NPROC=\$(busybox nproc)"]} {
+    set timeout 30
+    expect {
+        -re {NPROC=([0-9]+)} { set NPROC $expect_out(1,string) ; exp_continue }
+        -re "\n$PROMPT"      { }
+        timeout              { }
+    }
+}
+if {$NPROC < 1} {
+    bail "could not read the board's cpu count. Every pinning decision below depends on it."
+}
+puts "===== the board reports $NPROC cpu(s)"
+
+foreach {_who _cpu} [list A $CPU_A B $CPU_B] {
+    if {$_cpu >= $NPROC} {
+        bail "cpu_$_who is $_cpu but this board has only $NPROC cpu(s) (0..[expr {$NPROC - 1}]).\
+ On a single-core bitstream use -samecore, which puts both workloads on cpu $CPU_A."
+    }
+}
+
+# Each workload is pinned with `taskset -c <one cpu>`, so each must be single-threaded. Checked
+# only for the workloads actually in this plan.
+set _thr [dict create lu $LU_P lu_cb $LU_P streamcluster $SC_THREADS canneal $CANN_THREADS \
+                      radix 1 fft 1]
+foreach _w [list $WL_A $WL_B] {
+    if {![dict exists $_thr $_w]} { continue }
+    set _t [dict get $_thr $_w]
+    if {$_t != 1 && !$ALLOW_OVERSUB} {
+        bail "$_w is configured for $_t thread(s) but is pinned to a single cpu, which\
+ oversubscribes that cpu instead of running $_t-wide. Set it to 1 thread, or pass\
+ -allow-oversubscribe if the oversubscription is the thing you mean to measure."
+    }
+}
+if {$SAMECORE} {
+    puts "===== -samecore: both workloads share cpu $CPU_A (2 threads on 1 cpu, deliberately)"
+}
 
 # The workloads are named relatively (./lu_ncb), and pair.sh cds to $BOARD_DIR itself - but
 # run_phase's "test -x ./lu_ncb" guard runs in whatever the console's cwd is, and step 5 left it
@@ -739,7 +986,37 @@ proc find_row {label mig} {
     if {[llength $hits] == 0} { return "" }
     set out [lindex $hits 0]
     set n   [llength $hits]
-    if {$n == 1} { return [dict set out n 1] }
+
+    # FIX 3.7 (2026-10-06): carry the spread, not just the mean. The pair's memAcc varies by 5.7%
+    # within a session and solo-streamcluster's by 8.9%, so a bare mean cannot be judged - the
+    # three OFF runs behind the 2026-10-05 headline were 12,757,765 / 14,109,993 / 14,083,101 and
+    # nothing in the report revealed that the first was 10% below the other two.
+    set ma [list]
+    foreach r $hits {
+        set rd [dget [dict get $r counters] memReads]
+        set wr [dget [dict get $r counters] memWrites]
+        if {[num $rd] && [num $wr]} { lappend ma [expr {$rd + $wr}] }
+    }
+    set sd 0 ; set lo "" ; set hi ""
+    if {[llength $ma] > 0} {
+        set lo [lindex $ma 0] ; set hi [lindex $ma 0] ; set tot 0.0
+        foreach v $ma {
+            if {$v < $lo} { set lo $v }
+            if {$v > $hi} { set hi $v }
+            set tot [expr {$tot + $v}]
+        }
+        if {[llength $ma] > 1} {
+            set mu [expr {$tot / [llength $ma]}] ; set ss 0.0
+            foreach v $ma { set ss [expr {$ss + ($v - $mu) * ($v - $mu)}] }
+            set sd [expr {round(sqrt($ss / ([llength $ma] - 1)))}]
+        }
+    }
+    dict set out n          $n
+    dict set out sd_memacc  $sd
+    dict set out min_memacc $lo
+    dict set out max_memacc $hi
+    if {$n == 1} { return $out }
+
     set avg [dict create]
     foreach c $CSV_COLS {
         set tot 0.0 ; set seen 0
@@ -750,11 +1027,43 @@ proc find_row {label mig} {
         if {$seen > 0} { dict set avg $c [expr {round($tot / $seen)}] }
     }
     dict set out counters $avg
-    return [dict set out n $n]
+
+    # FIX 3.6 (2026-10-06): average the timing fields over the SAME repeats as the counters. This
+    # proc used to average the counters and return repeat 1's timing, so the report printed a
+    # three-run mean memAcc next to a one-run wall_a and overlap_frac. ra/rb are exit codes, not
+    # quantities, so they keep the first repeat's value - every repeat that reaches here is OK
+    # anyway, so they are all "0".
+    set pavg [dict get $out pairm]
+    foreach c {window_s wall_a wall_b overlap_s overlap_frac} {
+        set tot 0.0 ; set seen 0
+        foreach r $hits {
+            set v [dget [dict get $r pairm] $c]
+            if {[num $v]} { set tot [expr {$tot + $v}] ; incr seen }
+        }
+        if {$seen > 0} { dict set pavg $c [format %.3f [expr {$tot / $seen}]] }
+    }
+    dict set out pairm $pavg
+    return $out
+}
+
+# mean +- sd (n), with the min-max range when there is more than one run. Printed next to every
+# averaged memAcc so the reader can size the noise without opening the CSV.
+proc spread {r} {
+    set n  [nreps $r]
+    set sd [dget $r sd_memacc 0]
+    set lo [dget $r min_memacc ""]
+    set hi [dget $r max_memacc ""]
+    if {$n <= 1} { return "n=1" }
+    set ma [memacc $r]
+    set pc "" 
+    if {[num $ma] && $ma != 0} { set pc [format " (%.1f%%)" [expr {100.0 * $sd / $ma}]] }
+    return "n=$n  sd=$sd$pc  range $lo..$hi"
 }
 proc c_of    {r k} { return [dget [dict get $r counters] $k 0] }
 proc nreps   {r}   { return [dget $r n 1] }
 proc memacc  {r}   { return [expr {[c_of $r memReads] + [c_of $r memWrites]}] }
+# primary + secondary only, and that is correct: probedHit is a subset of the hits, not a fifth
+# outcome. Verified 2026-10-06 - see the identity gate in measure. Do not add probedHit here.
 proc hitpct  {r}   {
     set a [c_of $r accessA]
     if {$a == 0} { return "n/a" }
@@ -788,13 +1097,13 @@ foreach r $::results {
 # ── Interference, per phase ────────────────────────────────────────────────────────────────────
 # The whole point of the solo rows. All three numbers are cache-wide, so this is the only way to
 # separate "the pair costs more" from "one of them was always expensive".
-set pair_label "pair-$WL_A+$WL_B"
+set pair_label $PAIR_LABEL
 foreach ph $PHASES {
-    set ra [find_row "solo-$WL_A" $ph]
-    set rb [find_row "solo-$WL_B" $ph]
-    set rp [find_row $pair_label   $ph]
+    set ra [find_row $SOLO_A     $ph]
+    set rb [find_row $SOLO_B     $ph]
+    set rp [find_row $pair_label $ph]
     if {$ra eq "" || $rb eq "" || $rp eq ""} {
-        puts "\n──── migrate=$ph: not all three of solo-$WL_A / solo-$WL_B / $pair_label\
+        puts "\n──── migrate=$ph: not all three of $SOLO_A / $SOLO_B / $pair_label\
 completed, so no interference figure for this phase."
         continue
     }
@@ -802,13 +1111,15 @@ completed, so no interference figure for this phase."
     set sum [expr {$ma + $mb}]
     set itf [expr {$mp - $sum}]
     puts "\n──── migrate=$ph  interference"
-    puts [format "       solo-%-14s memAcc %12s   hit %7s%%   %ss   (mean of %s run(s))" \
-          $WL_A $ma [hitpct $ra] [dget [dict get $ra pairm] wall_a "?"] [nreps $ra]]
-    puts [format "       solo-%-14s memAcc %12s   hit %7s%%   %ss   (mean of %s run(s))" \
-          $WL_B $mb [hitpct $rb] [dget [dict get $rb pairm] wall_a "?"] [nreps $rb]]
+    puts [format "       %-19s memAcc %12s   hit %7s%%   %ss   %s" \
+          $SOLO_A $ma [hitpct $ra] [dget [dict get $ra pairm] wall_a "?"] [spread $ra]]
+    puts [format "       %-19s memAcc %12s   hit %7s%%   %ss   %s" \
+          $SOLO_B $mb [hitpct $rb] [dget [dict get $rb pairm] wall_a "?"] [spread $rb]]
     puts [format "       sum of solos        memAcc %12s" $sum]
-    puts [format "       pair                memAcc %12s   hit %7s%%   overlap %s of the window   (mean of %s run(s))" \
-          $mp [hitpct $rp] [dget [dict get $rp pairm] overlap_frac "n/a"] [nreps $rp]]
+    puts [format "       dirty share of evictions:  %s %s%%   %s %s%%   pair %s%%" \
+          $SOLO_A [dirtyfrac $ra] $SOLO_B [dirtyfrac $rb] [dirtyfrac $rp]]
+    puts [format "       pair                memAcc %12s   hit %7s%%   overlap %s   %s" \
+          $mp [hitpct $rp] [dget [dict get $rp pairm] overlap_frac "n/a"] [spread $rp]]
     puts [format "       interference        %12s  (%s vs the sum of the solos)" $itf [pct $mp $sum]]
     set ov [dget [dict get $rp pairm] overlap_frac "n/a"]
     if {[num $ov] && $ov < 0.5} {
@@ -834,8 +1145,8 @@ if {"off" in $PHASES && "on" in $PHASES} {
               [pct [c_of $rn L2_Cycles] [c_of $ro L2_Cycles]] \
               [expr {$wd > 2.0 ? [format "   !! work differs %.1f%%" $wd] : ""}]]
     }
-    set rao [find_row "solo-$WL_A" off] ; set ran [find_row "solo-$WL_A" on]
-    set rbo [find_row "solo-$WL_B" off] ; set rbn [find_row "solo-$WL_B" on]
+    set rao [find_row $SOLO_A off] ; set ran [find_row $SOLO_A on]
+    set rbo [find_row $SOLO_B off] ; set rbn [find_row $SOLO_B on]
     set rpo [find_row $pair_label  off] ; set rpn [find_row $pair_label  on]
     if {$rao ne "" && $ran ne "" && $rbo ne "" && $rbn ne "" && $rpo ne "" && $rpn ne ""} {
         set io [expr {[memacc $rpo] - [memacc $rao] - [memacc $rbo]}]
