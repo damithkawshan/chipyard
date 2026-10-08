@@ -1,0 +1,111 @@
+--- run_parsec_session.exp.orig	2026-10-05 22:47:04.798216424 +1100
++++ run_parsec_session.exp	2026-10-08 14:47:43.507885559 +1100
+@@ -1,5 +1,24 @@
+ #!/usr/bin/expect --
+ #
++# ══════════════════════════════════════════════════════════════════════════════════════════════
++# THIS IS A COPY (2026-10-08) of scripts/ssbc_scripts/run_parsec_session.exp, made for the LU-pair test in
++# clean-runs/lu-pair-single-core-20261008/. The original is untouched. It keeps the original's file name ON PURPOSE:
++# every harness's "is another session using the board?" guard looks for run_(parsec|pair)_session.exp in the
++# process list, so a copy under another name would be invisible to the older scripts and they could pkill its
++# picocom mid-run. Diff against the pristine copy: diff run_parsec_session.exp.orig run_parsec_session.exp
++#
++# What differs from the original (everything else, including the staging and every board step up to the measured
++# command, is byte-for-byte the sweep's, so a pair window has exactly the sweep's history behind it):
++#   1. LIB points at the ORIGINAL lib/ by absolute path (the copy does not sit next to it).
++#   2. -plan lupair: ONE point that runs TWO lu_ncb processes at the same time on the one core - same -n, two block
++#      sizes (-pair-n N, -pair-b BA,BB). Both are started in the background of the one measured sh -c and the window
++#      closes when BOTH have exited (run to completion; there is no per-program instruction counter to cut them at the
++#      same work). Each child's stdout/stderr go to a.out/a.err and b.out/b.err; their exit codes are echoed as
++#      "PAIR-RC a=<rc> b=<rc>" and the shell's exit status is 0 only if both are 0.
++#   3. After a measured window, post_window prints the two reports (cat a.out b.out a.err b.err) as a SEPARATE command,
++#      outside the counter window. Only for -plan lupair.
++# ══════════════════════════════════════════════════════════════════════════════════════════════
++#
+ # run_parsec_session.exp - program the VCU118, boot it, stage the workloads, and measure the SBC
+ #                          migrate=off vs migrate=on A/B over a plan of runs.
+ #
+@@ -94,7 +113,7 @@
+ # Serial, zmodem and staging are identical across the ssbc session scripts and now live in lib/.
+ # Each file lists the globals it expects in its own header. Sourced before this script's own
+ # configuration so that anything below can override a shared default deliberately.
+-set LIB [file join [file dirname [file normalize [info script]]] lib]
++set LIB "/home/damith/Research/repos/chipyard_performance_eval/chipyard/scripts/ssbc_scripts/lib"   ;# the copy does not sit next to lib/
+ source [file join $LIB config.exp]     ;# DEVICE, BAUD, PROMPT, CY, SCRIPTS, SW_DIR, STAGED, LOGDIR
+ source [file join $LIB board.exp]      ;# board_cmd board_run board_probe bail drain dget
+ source [file join $LIB transfer.exp]   ;# zmodem_send
+@@ -149,6 +168,10 @@
+ set LU_P    {1 2 4}
+ set LU_POL  {plru random}
+ 
++# -plan lupair: two lu_ncb processes at once on the one core. Same -n, one block size each. (copy only)
++set PAIR_N  512
++set PAIR_B  {32 128}
++
+ # ══════════════════════════════════════════════════════════════════════════════════════════════
+ # Command line
+ # ══════════════════════════════════════════════════════════════════════════════════════════════
+@@ -176,6 +199,8 @@
+         "-lu-p"      { incr i; set LU_P [split [lindex $argv $i] ","] }
+         "-lu-policy" { incr i; set LU_POL [split [lindex $argv $i] ","] }
+         "-lu-centre" { incr i; lassign [split [lindex $argv $i] ","] LU_CP LU_CN LU_CB }
++        "-pair-n"    { incr i; set PAIR_N [lindex $argv $i] }
++        "-pair-b"    { incr i; set PAIR_B [split [lindex $argv $i] ","] }
+         "-cal-nets"  { incr i; set CAL_NETS [split [lindex $argv $i] ","] }
+         "-cal-swaps" { incr i; set CAL_SWAPS [split [lindex $argv $i] ","] }
+         "-cal-steps" { incr i; set CAL_STEPS [lindex $argv $i] }
+@@ -185,7 +210,9 @@
+         default      { puts "unknown arg: $a"; exit 2 }
+     }
+ }
+-if {$PLAN ni {parsec lu cal sccal}} { puts "-plan must be parsec, lu, cal or sccal"; exit 2 }
++if {$PLAN ni {parsec lu cal sccal lupair}} { puts "-plan must be parsec, lu, cal, sccal or lupair"; exit 2 }
++if {[llength $PAIR_B] != 2 || ![string is integer -strict $PAIR_N]} { puts "-pair-b takes two block sizes, -pair-n one integer"; exit 2 }
++foreach _b $PAIR_B { if {![string is integer -strict $_b]} { puts "-pair-b takes two integers"; exit 2 } }
+ if {$PUSH ni {always verify none cache}} { puts "-push must be always, verify, cache or none"; exit 2 }
+ foreach ph $PHASES { if {$ph ni {off on}} { puts "-phases takes off and/or on"; exit 2 } }
+ if {$POLICY ni {plru random}} { puts "-policy must be plru or random"; exit 2 }
+@@ -386,8 +413,35 @@
+     lappend plan [point $label lu_ncb [bench_lu_ncb_cmd $p $n $b] $axis $policy $p $n $b]
+ }
+ 
++# The LU-pair plan (copy only): ONE point, two lu_ncb at once on the one core.
++#   ./lu_ncb -p1 -nN -bA  and  ./lu_ncb -p1 -nN -bB  are both started in the background of the one measured sh -c;
++#   the shell waits for each by pid and echoes both exit codes; its own exit status is 0 only if both are 0.
++# Run to completion, not "until the first one finishes": the window closes when BOTH have exited, so each program
++# has done its whole job in the OFF and the ON arm (accessA is then comparable between the arms). With the b=32 and
++# b=128 solos at 22.6 s and 24.1 s alone, they overlap for almost the whole window.
++# Output files: a.out/a.err = the first block size, b.out/b.err = the second. The command stays free of single quotes
++# (it is wrapped in sh -c '...' by measure) and of anything but shell builtins besides the two lu_ncb, so the window
++# holds no extra exec. The trailing `2> wl.err` that measure appends lands on the last `test`.
++proc lupair_cmd {n ba bb} {
++    return "./lu_ncb -p1 -n$n -b$ba >a.out 2>a.err & PA=\$! ; ./lu_ncb -p1 -n$n -b$bb >b.out 2>b.err & PB=\$! ; wait \$PA ; RA=\$? ; wait \$PB ; RB=\$? ; echo PAIR-RC a=\$RA b=\$RB ; test \$RA -eq 0 && test \$RB -eq 0"
++}
++
++proc plan_lupair {} {
++    lassign $::PAIR_B ba bb
++    set label "lupair-p1-n${::PAIR_N}-b${ba}+b${bb}-$::POLICY"
++    return [list [point $label lu_ncb [lupair_cmd $::PAIR_N $ba $bb] lupair $::POLICY 1 $::PAIR_N "${ba}+${bb}"]]
++}
++
++# After a measured lupair window: print both reports. A separate command, so it is outside the counter window and the
++# measured command line stays short.
++proc post_window {pt} {
++    if {[dict get $pt axis] ne "lupair"} { return }
++    board_run "cat a.out b.out a.err b.err"
++}
++
+ proc plan_for {which} {
+     switch -- $which {
++        lupair  { return [plan_lupair] }
+         lu      { return [plan_lu] }
+         cal     { return [plan_cal] }
+         sccal   { return [plan_sccal] }
+@@ -615,6 +669,7 @@
+         for {set rep 1} {$rep <= $REPEAT} {incr rep} {
+             if {[measure $pt $mig $rep]} {
+                 set ::consec_fail 0
++                post_window $pt
+             } else {
+                 incr ::consec_fail
+             }
